@@ -1,0 +1,52 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+///////////////////////////////////////////////////////////////////////////////////////////////////
+#pragma once
+
+#include <atomic>
+#include <exception>
+#include <mutex>
+#include <queue>
+#include <unordered_map>
+#include <map>
+#include <vector>
+#include <utility>
+#include <memory>
+#include <optional>
+#include <string>
+#include "plugin.hpp"
+
+namespace ov {
+namespace auto_plugin {
+class CompiledModel;
+class InferRequest : public ov::ISyncInferRequest {
+public:
+    explicit InferRequest(const std::shared_ptr<const ov::auto_plugin::CompiledModel>& compiled_model,
+                          const SoAsyncInferRequest& request_to_share_tensors_with);
+    ~InferRequest();
+
+    void infer() override;
+    std::vector<ov::SoPtr<ov::IVariableState>> query_state() const override;
+    std::vector<ov::ProfilingInfo> get_profiling_info() const override;
+
+    const SoAsyncInferRequest& get_shared_request();
+    void set_scheduled_profiling_info(std::vector<ov::ProfilingInfo> info);
+    void set_scheduled_profiling_error(std::exception_ptr error);
+    void set_scheduled_request(SoAsyncInferRequest request);
+    void reset_scheduled_profiling();
+    // Auto-Device impl specific: sets the data (tensors from the device-less requests to the specific device request)
+    void set_tensors_to_another_request(const SoAsyncInferRequest& req);
+    void set_tensor(const ov::Output<const ov::Node>& port, const ov::SoPtr<ov::ITensor>& tensor) override;
+
+private:
+    SoAsyncInferRequest m_shared_request;
+    // non-dynamic modes only: the worker request is never released, so profiling is read lazily
+    SoAsyncInferRequest m_scheduled_request;
+    // a snapshot, so that the backend request, and the compiled model behind it, is not kept alive
+    std::optional<std::vector<ov::ProfilingInfo>> m_scheduled_profiling_info;
+    std::exception_ptr m_scheduled_profiling_error;
+};
+} // namespace auto_plugin
+} // namespace ov

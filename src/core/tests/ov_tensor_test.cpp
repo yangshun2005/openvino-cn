@@ -1,0 +1,1841 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#include <gmock/gmock.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <numeric>
+#include <utility>
+#include <vector>
+
+#include "common_test_utils/common_utils.hpp"
+#include "common_test_utils/test_assertions.hpp"
+#include "openvino/core/except.hpp"
+#include "openvino/core/partial_shape.hpp"
+#include "openvino/core/shape.hpp"
+#include "openvino/core/strides.hpp"
+#include "openvino/core/type/element_type.hpp"
+#include "openvino/core/type/element_type_traits.hpp"
+#include "openvino/op/constant.hpp"
+#include "openvino/op/parameter.hpp"
+#include "openvino/reference/utils/coordinate_transform.hpp"
+#include "openvino/runtime/aligned_buffer.hpp"
+#include "openvino/runtime/allocator.hpp"
+#include "openvino/runtime/make_tensor.hpp"
+#include "openvino/runtime/remote_tensor.hpp"
+#include "openvino/runtime/tensor.hpp"
+#include "openvino/util/mmap_object.hpp"
+namespace ov::test {
+using OVTensorTest = ::testing::Test;
+using testing::_, testing::HasSubstr;
+
+const size_t string_size = ov::element::string.size();
+
+inline ov::Strides byteStrides(const ov::Strides& strides, const ov::element::Type& type) {
+    ov::Strides byte_strides(strides.size());
+    for (size_t i = 0; i < strides.size(); ++i)
+        byte_strides[i] = strides[i] * type.size();
+    return byte_strides;
+}
+
+TEST_F(OVTensorTest, canCreateTensor) {
+    ov::Shape shape = {4, 3, 2};
+    ov::Tensor t{ov::element::f32, shape};
+    const std::size_t totalSize = ov::shape_size(shape);
+    ASSERT_EQ(totalSize, t.get_size());
+    ASSERT_NE(nullptr, t.data());
+    ASSERT_EQ(ov::element::f32, t.get_element_type());
+    ASSERT_EQ(shape, t.get_shape());
+    ASSERT_NE(shape, t.get_strides());
+    ASSERT_EQ(byteStrides(ov::Strides({6, 2, 1}), t.get_element_type()), t.get_strides());
+    ASSERT_EQ(ov::element::f32.size() * totalSize, t.get_byte_size());
+    ASSERT_THROW(t.data(ov::element::i64), ov::Exception);
+    ASSERT_THROW(t.data<std::int32_t>(), ov::Exception);
+}
+
+TEST_F(OVTensorTest, canCreateStringTensor) {
+    ov::Shape shape = {4, 3, 2};
+    ov::Tensor t{ov::element::string, shape};
+    const std::size_t totalSize = ov::shape_size(shape);
+    ASSERT_EQ(totalSize, t.get_size());
+    ASSERT_NE(nullptr, t.data());
+    ASSERT_EQ(ov::element::string, t.get_element_type());
+    ASSERT_EQ(shape, t.get_shape());
+    ASSERT_NE(shape, t.get_strides());
+    ASSERT_EQ(byteStrides(ov::Strides({6, 2, 1}), t.get_element_type()), t.get_strides());
+    ASSERT_EQ(string_size * totalSize, t.get_byte_size());
+    using namespace ov::element;
+    for (auto&& type : {boolean, i8, u8, i16, u16, i32, u32, i64, u64, f16, bf16, f32, f64}) {
+        ASSERT_THROW(t.data(type), ov::Exception);
+    }
+    ASSERT_THROW(t.data<std::int32_t>(), ov::Exception);
+}
+
+TEST_F(OVTensorTest, createTensorFromPort) {
+    auto parameter1 = std::make_shared<ov::op::v0::Parameter>(ov::element::f64, ov::Shape{1, 3, 2, 2});
+    auto parameter2 = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::Shape{1, 3});
+    auto parameter3 = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, ov::PartialShape::dynamic());
+    float data[] = {5.f, 6.f, 7.f};
+    ov::Tensor t1{parameter1->output(0)};
+    ov::Tensor t2{parameter2->output(0), data};
+    ov::Tensor t3{parameter3->output(0)};
+    ov::Tensor t4{parameter3->output(0), data};
+
+    EXPECT_EQ(t1.get_shape(), parameter1->get_shape());
+    EXPECT_EQ(t1.get_element_type(), parameter1->get_element_type());
+    EXPECT_EQ(t2.get_shape(), parameter2->get_shape());
+    EXPECT_EQ(t2.get_element_type(), parameter2->get_element_type());
+    EXPECT_EQ(t3.get_shape(), ov::Shape{0});
+    EXPECT_EQ(t3.get_element_type(), parameter3->get_element_type());
+    EXPECT_EQ(t4.get_shape(), ov::Shape{0});
+    EXPECT_EQ(t4.get_element_type(), parameter3->get_element_type());
+}
+
+TEST_F(OVTensorTest, createTensorFromConstantPort) {
+    auto constant1 = std::make_shared<ov::op::v0::Constant>(ov::element::f64, ov::Shape{1, 3, 2, 2}, 0);
+    auto constant2 = std::make_shared<ov::op::v0::Constant>(ov::element::f32, ov::Shape{1, 3}, 1.0f);
+    ov::Tensor t1{constant1->output(0)};
+    ov::Tensor t2{constant2->output(0), constant1->get_data_ptr()};
+    const auto& t2c = t2;
+    const ov::Tensor t3{constant2->output(0), constant2->get_data_ptr()};
+
+    EXPECT_EQ(t1.get_shape(), constant1->get_shape());
+    EXPECT_EQ(t1.get_element_type(), constant1->get_element_type());
+    EXPECT_EQ(t2.get_shape(), constant2->get_shape());
+    EXPECT_EQ(t2.get_element_type(), constant2->get_element_type());
+    OV_EXPECT_THROW(t2.data(), ov::Exception, _);
+    OV_ASSERT_NO_THROW(t2c.data());
+
+    EXPECT_EQ(t3.get_shape(), constant2->get_shape());
+    EXPECT_EQ(t3.get_element_type(), constant2->get_element_type());
+    OV_ASSERT_NO_THROW(t3.data());
+}
+
+TEST_F(OVTensorTest, createStringTensorFromPort) {
+    auto parameter1 = std::make_shared<ov::op::v0::Parameter>(ov::element::string, ov::Shape{1, 3, 2, 2});
+    auto parameter2 = std::make_shared<ov::op::v0::Parameter>(ov::element::string, ov::Shape{1, 3});
+    auto parameter3 = std::make_shared<ov::op::v0::Parameter>(ov::element::string, ov::PartialShape::dynamic());
+
+    std::string data[] = {"one", "two sentence", "three 3 sentence"};
+    ov::Tensor t1{parameter1->output(0)};
+    ov::Tensor t2{parameter2->output(0), data};
+    ov::Tensor t3{parameter3->output(0)};
+    ov::Tensor t4{parameter3->output(0), data};
+
+    EXPECT_EQ(t1.get_shape(), parameter1->get_shape());
+    EXPECT_EQ(t1.get_element_type(), parameter1->get_element_type());
+    EXPECT_EQ(t2.get_shape(), parameter2->get_shape());
+    EXPECT_EQ(t2.get_element_type(), parameter2->get_element_type());
+    EXPECT_EQ(t3.get_shape(), ov::Shape{0});
+    EXPECT_EQ(t3.get_element_type(), parameter3->get_element_type());
+    EXPECT_EQ(t4.get_shape(), ov::Shape{0});
+    EXPECT_EQ(t4.get_element_type(), parameter3->get_element_type());
+}
+
+TEST_F(OVTensorTest, canAccessF16Tensor) {
+    ov::Shape shape = {4, 3, 2};
+    ov::Tensor t{ov::element::f16, shape};
+    EXPECT_NE(nullptr, t.data());
+    EXPECT_NO_THROW(t.data(ov::element::f16));
+    EXPECT_NO_THROW(t.data<ov::float16>());
+    EXPECT_NO_THROW(t.data<ov::bfloat16>());
+    EXPECT_THROW(t.data<std::uint16_t>(), ov::Exception);
+    EXPECT_THROW(t.data<std::int16_t>(), ov::Exception);
+}
+
+TEST_F(OVTensorTest, canAccessStringTensor) {
+    ov::Shape shape = {4, 3, 2};
+    ov::Tensor t{ov::element::string, shape};
+    EXPECT_NE(nullptr, t.data());
+    EXPECT_NO_THROW(t.data(ov::element::string));
+    EXPECT_NO_THROW(t.data<std::string>());
+
+    // check that all elements of string ov::Tensor are empty strings
+    auto string_elements = t.data<std::string>();
+    auto num_elements = t.get_size();
+    for (size_t ind = 0; ind < num_elements; ++ind) {
+        EXPECT_EQ(string_elements[ind], std::string());
+    }
+
+    EXPECT_THROW(t.data<std::uint16_t>(), ov::Exception);
+    EXPECT_THROW(t.data<std::int16_t>(), ov::Exception);
+}
+
+TEST_F(OVTensorTest, canAccessU8Tensor) {
+    ov::Shape shape = {4, 3, 2};
+    ov::Tensor t{ov::element::u8, shape};
+    EXPECT_NE(nullptr, t.data());
+    EXPECT_NO_THROW(t.data(ov::element::u8));
+    EXPECT_NO_THROW(t.data<char>());
+    EXPECT_NO_THROW(t.data<unsigned char>());
+    EXPECT_NO_THROW(t.data<bool>());
+    EXPECT_NO_THROW(t.data<uint8_t>());
+    EXPECT_NO_THROW(t.data<int8_t>());
+    EXPECT_THROW(t.data<float>(), ov::Exception);
+    EXPECT_THROW(t.data<double>(), ov::Exception);
+    EXPECT_THROW(t.data<uint32_t>(), ov::Exception);
+}
+
+TEST_F(OVTensorTest, emptySize) {
+    ov::Tensor t(ov::element::f32, {0});
+    ASSERT_NE(nullptr, t.data());
+}
+
+TEST_F(OVTensorTest, emptySizeStringTensor) {
+    ov::Tensor t(ov::element::string, {0});
+    ASSERT_NE(nullptr, t.data());
+}
+
+TEST_F(OVTensorTest, operators) {
+    ov::Tensor t;
+    ASSERT_FALSE(t);
+    ASSERT_TRUE(!t);
+}
+
+struct OVMockAllocator {
+    struct Impl {
+        MOCK_METHOD(void*, allocate, (size_t, size_t), ());
+        MOCK_METHOD(void, deallocate, (void*, size_t, size_t), ());
+        MOCK_METHOD(bool, is_equal, (const Impl&), (const, noexcept));
+    };
+    OVMockAllocator() : impl{std::make_shared<Impl>()} {}
+
+    void* allocate(size_t b, size_t a) {
+        return impl->allocate(b, a);
+    }
+
+    void deallocate(void* ptr, size_t b, size_t a) noexcept {
+        impl->deallocate(ptr, b, a);
+    }
+    bool is_equal(const OVMockAllocator& other) const {
+        return impl->is_equal(*other.impl);
+    }
+
+    std::shared_ptr<Impl> impl;
+};
+
+TEST_F(OVTensorTest, canCreateTensorUsingMockAllocator) {
+    constexpr size_t exp_size = 24;
+    ov::Shape shape = {1, 2, 3};
+    OVMockAllocator allocator;
+
+    EXPECT_CALL(*allocator.impl, allocate(exp_size, _)).WillRepeatedly(testing::Return(reinterpret_cast<void*>(1)));
+    EXPECT_CALL(*allocator.impl, deallocate(_, exp_size, _)).Times(1);
+
+    { ov::Tensor t{ov::element::f32, shape, allocator}; }
+}
+
+TEST_F(OVTensorTest, canCreateTensorU2UsingMockAllocator) {
+    constexpr size_t exp_size = 2;
+    ov::Shape shape = {1, 2, 3};
+    OVMockAllocator allocator;
+
+    EXPECT_CALL(*allocator.impl, allocate(exp_size, _)).WillRepeatedly(testing::Return(reinterpret_cast<void*>(1)));
+    EXPECT_CALL(*allocator.impl, deallocate(_, exp_size, _)).Times(1);
+
+    { ov::Tensor t{ov::element::u2, shape, allocator}; }
+}
+
+TEST_F(OVTensorTest, canCreateTensorU3UsingMockAllocator) {
+    constexpr size_t exp_size = 3;
+    ov::Shape shape = {1, 2, 3};
+    OVMockAllocator allocator;
+
+    EXPECT_CALL(*allocator.impl, allocate(exp_size, _)).WillRepeatedly(testing::Return(reinterpret_cast<void*>(1)));
+    EXPECT_CALL(*allocator.impl, deallocate(_, exp_size, _)).Times(1);
+
+    { ov::Tensor t{ov::element::u3, shape, allocator}; }
+}
+
+TEST_F(OVTensorTest, canCreateTensorU6UsingMockAllocator) {
+    constexpr size_t exp_size = 5;
+    ov::Shape shape = {1, 2, 3};
+    OVMockAllocator allocator;
+
+    EXPECT_CALL(*allocator.impl, allocate(exp_size, _)).WillRepeatedly(testing::Return(reinterpret_cast<void*>(1)));
+    EXPECT_CALL(*allocator.impl, deallocate(_, exp_size, _)).Times(1);
+
+    { ov::Tensor t{ov::element::u6, shape, allocator}; }
+}
+
+TEST_F(OVTensorTest, canAccessExternalData) {
+    ov::Shape shape = {1, 1, 3};
+    float data[] = {5.f, 6.f, 7.f};
+    ov::Tensor t{ov::element::f32, shape, data};
+    {
+        float* ptr = t.data<float>();
+        ASSERT_EQ(ptr[2], 7);
+        ASSERT_EQ(data, t.data(ov::element::f32));
+        ASSERT_EQ(data, ptr);
+        ASSERT_THROW(t.data<std::int16_t>(), ov::Exception);
+        ASSERT_EQ(byteStrides(ov::row_major_strides(shape), t.get_element_type()), t.get_strides());
+        ASSERT_EQ(ov::shape_size(shape), t.get_size());
+        ASSERT_EQ(ov::shape_size(shape) * ov::element::f32.size(), t.get_byte_size());
+    }
+}
+
+TEST_F(OVTensorTest, canAccessExternalDataStringTensor) {
+    ov::Shape shape = {1, 1, 3};
+    std::string data[] = {"one two three", "123", ""};
+    ov::Tensor t{ov::element::string, shape, data};
+    {
+        std::string* ptr = t.data<std::string>();
+        ASSERT_EQ(ptr[2], "");
+        ASSERT_EQ(data, t.data(ov::element::string));
+        ASSERT_EQ(data, ptr);
+        ASSERT_THROW(t.data<std::int16_t>(), ov::Exception);
+        ASSERT_EQ(byteStrides(ov::row_major_strides(shape), t.get_element_type()), t.get_strides());
+        ASSERT_EQ(ov::shape_size(shape), t.get_size());
+        ASSERT_EQ(ov::shape_size(shape) * string_size, t.get_byte_size());
+    }
+}
+
+TEST_F(OVTensorTest, canAccessExternalDataWithStrides) {
+    ov::Shape shape = {2, 3};
+    float data[] = {5.f, 6.f, 7.f, 0.f, 1.f, 42.f, 3.f, 0.f};
+    ov::Tensor t{ov::element::f32, shape, data, {16, 4}};
+    ASSERT_EQ(ov::Strides({16, 4}), t.get_strides());
+    {
+        ASSERT_EQ((ov::Shape{2, 3}), t.get_shape());
+        const float* ptr = t.data<const float>();
+        ASSERT_EQ(ptr[5], 42);
+    }
+}
+
+TEST_F(OVTensorTest, canAccessExternalDataWithStridesStringTensor) {
+    ov::Shape shape = {2, 3};
+    std::string data[] = {"abdcd efg hi", "01234", "xyz  ", "   ", "$%&%&& (*&&", "", "\n ", "\t "};
+    ov::Strides strides = {shape[1] * string_size + string_size, string_size};
+    ov::Tensor t{ov::element::string, shape, data, strides};
+    ASSERT_EQ(strides, t.get_strides());
+    {
+        ASSERT_EQ((ov::Shape{2, 3}), t.get_shape());
+        const std::string* ptr = t.data<const std::string>();
+        ASSERT_EQ(ptr[4], "$%&%&& (*&&");
+    }
+}
+
+TEST_F(OVTensorTest, cannotCreateTensorWithExternalNullptr) {
+    ov::Shape shape = {2, 3};
+    ASSERT_THROW(ov::Tensor(ov::element::f32, shape, static_cast<void*>(nullptr)), ov::Exception);
+}
+
+TEST_F(OVTensorTest, cannotCreateStringTensorWithExternalNullptr) {
+    ov::Shape shape = {2, 3};
+    ASSERT_THROW(ov::Tensor(ov::element::string, shape, static_cast<void*>(nullptr)), ov::Exception);
+}
+
+TEST_F(OVTensorTest, cannotCreateTensorWithWrongStrides) {
+    ov::Shape shape = {2, 3};
+    float data[] = {5.f, 6.f, 7.f, 0.f, 1.f, 42.f, 3.f, 0.f};
+    const auto el = ov::element::f32;
+    {
+        // strides.size() != shape.size()
+        EXPECT_THROW(ov::Tensor(el, shape, data, byteStrides({6, 3, 1}, el)), ov::Exception);
+    }
+    {
+        // strides values are element-wise >= ov::row_major_strides(shape) values
+        EXPECT_THROW(ov::Tensor(el, shape, data, byteStrides({2, 1}, el)), ov::Exception);
+        EXPECT_THROW(ov::Tensor(el, shape, data, byteStrides({3, 0}, el)), ov::Exception);
+        EXPECT_THROW(ov::Tensor(el, shape, data, byteStrides({3, 2}, el)), ov::Exception);
+        EXPECT_NO_THROW(ov::Tensor(el, shape, data, byteStrides({6, 2}, el)));
+    }
+    {
+        // strides are not divisible by elem_size
+        EXPECT_THROW(ov::Tensor(el, shape, data, {7, el.size()}), ov::Exception);
+        EXPECT_THROW(ov::Tensor(el, shape, data, {3, 0}), ov::Exception);
+        EXPECT_THROW(ov::Tensor(el, shape, data, {el.size(), 3}), ov::Exception);
+    }
+}
+
+TEST_F(OVTensorTest, cannotCreateStringTensorWithWrongStrides) {
+    ov::Shape shape = {2, 3};
+    std::string data[] = {"abdcd efg hi", "01234", "xyz  ", "   ", "$%&%&& (*&&", "", "\n ", "\t "};
+    const auto el = ov::element::string;
+    {
+        // strides.size() != shape.size()
+        EXPECT_THROW(ov::Tensor(el, shape, data, byteStrides({6, 3, 1}, el)), ov::Exception);
+    }
+    {
+        // strides values are element-wise >= ov::row_major_strides(shape) values
+        EXPECT_THROW(ov::Tensor(el, shape, data, byteStrides({2, 1}, el)), ov::Exception);
+        EXPECT_THROW(ov::Tensor(el, shape, data, byteStrides({3, 0}, el)), ov::Exception);
+        EXPECT_THROW(ov::Tensor(el, shape, data, byteStrides({3, 2}, el)), ov::Exception);
+        EXPECT_NO_THROW(ov::Tensor(el, shape, data, byteStrides({6, 2}, el)));
+    }
+    {
+        // strides are not divisible by elem_size
+        EXPECT_THROW(ov::Tensor(el, shape, data, {43, el.size()}), ov::Exception);
+        EXPECT_THROW(ov::Tensor(el, shape, data, {3, 0}), ov::Exception);
+        EXPECT_THROW(ov::Tensor(el, shape, data, {el.size(), 61}), ov::Exception);
+    }
+}
+
+TEST_F(OVTensorTest, saveDimsAndSizeAfterMove) {
+    ov::Shape shape = {1, 2, 3};
+    ov::Tensor t{ov::element::f32, shape};
+
+    ov::Tensor new_tensor(std::move(t));
+
+    ASSERT_EQ(shape, new_tensor.get_shape());
+    ASSERT_EQ(ov::element::f32, new_tensor.get_element_type());
+    ASSERT_EQ(byteStrides(ov::row_major_strides(shape), new_tensor.get_element_type()), new_tensor.get_strides());
+
+    ASSERT_THROW(t.get_size(), ov::Exception);
+    ASSERT_THROW(t.get_element_type(), ov::Exception);
+    ASSERT_THROW(t.get_byte_size(), ov::Exception);
+    ASSERT_THROW(t.get_strides(), ov::Exception);
+    ASSERT_THROW(t.get_shape(), ov::Exception);
+    ASSERT_THROW(t.set_shape({}), ov::Exception);
+    ASSERT_THROW(t.data(), ov::Exception);
+    ASSERT_THROW(t.data<float>(), ov::Exception);
+}
+
+TEST_F(OVTensorTest, saveDimsAndSizeAfterMoveStringTensor) {
+    ov::Shape shape = {1, 2, 3};
+    ov::Tensor t{ov::element::string, shape};
+
+    ov::Tensor new_tensor(std::move(t));
+
+    ASSERT_EQ(shape, new_tensor.get_shape());
+    ASSERT_EQ(ov::element::string, new_tensor.get_element_type());
+    ASSERT_EQ(byteStrides(ov::row_major_strides(shape), new_tensor.get_element_type()), new_tensor.get_strides());
+
+    ASSERT_THROW(t.get_size(), ov::Exception);
+    ASSERT_THROW(t.get_element_type(), ov::Exception);
+    ASSERT_THROW(t.get_byte_size(), ov::Exception);
+    ASSERT_THROW(t.get_strides(), ov::Exception);
+    ASSERT_THROW(t.get_shape(), ov::Exception);
+    ASSERT_THROW(t.set_shape({}), ov::Exception);
+    ASSERT_THROW(t.data(), ov::Exception);
+    ASSERT_THROW(t.data<std::string>(), ov::Exception);
+}
+
+// set_shape
+TEST_F(OVTensorTest, canSetShape) {
+    const ov::Shape origShape({1, 2, 3});
+    ov::Tensor t{ov::element::f32, origShape};
+    const ov::Shape newShape({4, 5, 6}), newShape2({4, 5, 6, 7});
+
+    const void* orig_data = t.data();
+    ASSERT_EQ(t.get_shape(), origShape);
+    OV_ASSERT_NO_THROW(t.set_shape(newShape));
+    ASSERT_EQ(newShape, t.get_shape());
+    ASSERT_EQ(byteStrides(ov::row_major_strides(newShape), t.get_element_type()), t.get_strides());
+    ASSERT_NE(orig_data, t.data());
+
+    // check that set_shape for copy changes original Tensor
+    {
+        ov::Tensor t2 = t;
+        OV_ASSERT_NO_THROW(t2.set_shape(newShape2));
+        ASSERT_EQ(newShape2, t.get_shape());
+        ASSERT_EQ(t2.get_shape(), t.get_shape());
+        ASSERT_EQ(t2.data(), t.data());
+        orig_data = t.data();
+    }
+
+    // set_shape for smaller memory - does not perform reallocation
+    {
+        t.set_shape(origShape);
+        ASSERT_EQ(origShape, t.get_shape());
+        ASSERT_EQ(orig_data, t.data());
+    }
+
+    // set shape bigger than maximum allocation size
+    {
+        constexpr auto max_dim = std::numeric_limits<size_t>::max();
+        OV_EXPECT_THROW(t.set_shape(Shape({max_dim, 2})), ov::Exception, _);
+        OV_EXPECT_THROW(t.set_shape(Shape({3, max_dim / 8})), ov::Exception, _);
+    }
+}
+
+TEST_F(OVTensorTest, canSetShapeStringTensor) {
+    const ov::Shape origShape({1, 2, 3});
+    ov::Tensor t{ov::element::string, {1, 2, 3}};
+    const ov::Shape newShape({4, 5, 6}), newShape2({4, 5, 6, 7});
+
+    const void* orig_data = t.data();
+    ASSERT_EQ(t.get_shape(), origShape);
+    OV_ASSERT_NO_THROW(t.set_shape(newShape));
+    ASSERT_EQ(newShape, t.get_shape());
+    ASSERT_EQ(byteStrides(ov::row_major_strides(newShape), t.get_element_type()), t.get_strides());
+    ASSERT_NE(orig_data, t.data());
+
+    // check that setShape for copy changes original Tensor
+    {
+        ov::Tensor t2 = t;
+        OV_ASSERT_NO_THROW(t2.set_shape(newShape2));
+        ASSERT_EQ(newShape2, t2.get_shape());
+        ASSERT_EQ(t2.get_shape(), t.get_shape());
+        ASSERT_EQ(t2.data(), t.data());
+        orig_data = t.data();
+    }
+
+    // set_shape for smaller memory - does not perform reallocation
+    {
+        OV_ASSERT_NO_THROW(t.set_shape(origShape));
+        ASSERT_EQ(origShape, t.get_shape());
+        ASSERT_EQ(orig_data, t.data());
+    }
+
+    // set shape bigger than maximum allocation size
+    {
+        constexpr auto max_dim = std::numeric_limits<size_t>::max();
+        OV_EXPECT_THROW(t.set_shape(Shape({3, max_dim / 80})), ov::Exception, _);
+    }
+}
+
+TEST_F(OVTensorTest, cannotSetShapeOfBiggerSizeOnPreallocatedMemory) {
+    float data[4 * 5 * 6 * 2];
+    ov::Tensor t{ov::element::f32, {1, 2, 3}, data};
+    const ov::Shape newShape({4, 5, 6});
+
+    ASSERT_THROW(t.set_shape(newShape), ov::Exception);
+}
+
+TEST_F(OVTensorTest, cannotSetShapeOfBiggerSizeOnPreallocatedMemoryStringTensor) {
+    std::string data[4 * 5 * 6];
+    ov::Tensor t{ov::element::string, {1, 2, 3}, data};
+    const ov::Shape newShape({4, 5, 6});
+
+    ASSERT_THROW(t.set_shape(newShape), ov::Exception);
+}
+
+TEST_F(OVTensorTest, canSetShapeOfSmallerSizeOnPreallocatedMemory) {
+    float data[4 * 5 * 6 * 2];
+    ov::Tensor t{ov::element::f32, {4, 5, 6}, data};
+    const ov::Shape newShape({1, 2, 3});
+
+    OV_ASSERT_NO_THROW(t.set_shape(newShape));
+}
+
+TEST_F(OVTensorTest, canSetShapeOfSmallerSizeOnPreallocatedMemoryStringTensor) {
+    std::string data[4 * 5 * 6];
+    ov::Tensor t{ov::element::string, {4, 5, 6}, data};
+    const ov::Shape newShape({1, 2, 3});
+
+    OV_ASSERT_NO_THROW(t.set_shape(newShape));
+}
+
+TEST_F(OVTensorTest, canSetShapeOfSameSizeOnPreallocatedMemory) {
+    float data[4 * 5 * 6 * 2];
+    ov::Tensor t{ov::element::f32, {4, 5, 6}, data};
+    const ov::Shape newShape({4, 5, 6});
+
+    OV_ASSERT_NO_THROW(t.set_shape(newShape));
+}
+
+TEST_F(OVTensorTest, canSetShapeOfSameSizeOnPreallocatedMemoryStringTensor) {
+    std::string data[4 * 5 * 6];
+    ov::Tensor t{ov::element::string, {4, 5, 6}, data};
+    const ov::Shape newShape({4, 5, 6});
+
+    OV_ASSERT_NO_THROW(t.set_shape(newShape));
+}
+
+TEST_F(OVTensorTest, canSetShapeOfOriginalSizeAfterDecreasingOnPreallocatedMemory) {
+    float data[4 * 5 * 6 * 2];
+    ov::Tensor t{ov::element::f32, {4, 5, 6}, data};
+    const ov::Shape smallerShape({1, 2, 3});
+    const ov::Shape originalShape({4, 5, 6});
+
+    OV_ASSERT_NO_THROW(t.set_shape(smallerShape));
+    OV_ASSERT_NO_THROW(t.set_shape(originalShape));
+}
+
+TEST_F(OVTensorTest, canSetShapeOfOriginalSizeAfterDecreasingOnPreallocatedMemoryStringTensor) {
+    std::string data[4 * 5 * 6];
+    ov::Tensor t{ov::element::string, {4, 5, 6}, data};
+    const ov::Shape smallerShape({1, 2, 3});
+    const ov::Shape originalShape({4, 5, 6});
+
+    OV_ASSERT_NO_THROW(t.set_shape(smallerShape));
+    OV_ASSERT_NO_THROW(t.set_shape(originalShape));
+}
+
+TEST_F(OVTensorTest, canSetShapeOfOriginalSizeAfterDecreasing) {
+    const ov::Shape shape({4, 5, 6}), small_shape({1, 2, 3});
+    ov::Tensor t{ov::element::f32, shape};
+    void* data = t.data();
+
+    OV_ASSERT_NO_THROW(t.set_shape(small_shape));
+    EXPECT_EQ(data, t.data());
+    OV_ASSERT_NO_THROW(t.set_shape(shape));
+    EXPECT_EQ(data, t.data());
+}
+
+TEST_F(OVTensorTest, canSetShapeOfOriginalSizeAfterDecreasingStringTensor) {
+    const ov::Shape shape({4, 5, 6}), small_shape({1, 2, 3});
+    ov::Tensor t{ov::element::string, shape};
+    void* data = t.data();
+
+    OV_ASSERT_NO_THROW(t.set_shape(small_shape));
+    EXPECT_EQ(data, t.data());
+    OV_ASSERT_NO_THROW(t.set_shape(shape));
+    EXPECT_EQ(data, t.data());
+}
+
+TEST_F(OVTensorTest, canChangeShapeOnStridedTensor) {
+    float data[64 * 4];
+    ov::Tensor t{ov::element::f32, {4, 2, 2}, data, {64, 16, 4}};
+    const ov::Shape incorrect_shape({2, 4, 2});
+    const ov::Shape correct_shape({1, 1, 2});
+
+    ASSERT_THROW(t.set_shape(incorrect_shape), ov::Exception);
+    OV_ASSERT_NO_THROW(t.set_shape(correct_shape));
+}
+
+TEST_F(OVTensorTest, canChangeShapeOnStridedTensorStringTensor) {
+    std::string data[64 * 4];
+    ov::Tensor t{ov::element::string, {4, 2, 2}, data, {8 * string_size, 3 * string_size, string_size}};
+    const ov::Shape incorrect_shape({2, 2, 4});
+    const ov::Shape correct_shape({1, 1, 2});
+
+    ASSERT_THROW(t.set_shape(incorrect_shape), ov::Exception);
+    OV_ASSERT_NO_THROW(t.set_shape(correct_shape));
+}
+
+TEST_F(OVTensorTest, createReadOnlyStridedView) {
+    const std::vector<std::string> data(64 * 4);
+    ov::Tensor strided_view{element::string, {4, 2, 2}, data.data(), {8 * string_size, 3 * string_size, string_size}};
+
+    OV_ASSERT_NO_THROW(static_cast<const Tensor&>(strided_view).data(element::string));
+    OV_ASSERT_NO_THROW(strided_view.data<const std::string>());
+    OV_EXPECT_THROW(strided_view.data<std::string>(), ov::Exception, HasSubstr("Can not access non-const pointer"));
+}
+
+TEST_F(OVTensorTest, makeRangeRoiTensor) {
+    ov::Tensor t{ov::element::i32, {1, 3, 6, 5}};  // RGBp picture of size (WxH) = 5x6
+    ov::Tensor roi_tensor{t, {0, 0, 1, 2}, {1, 3, 5, 4}};
+    ov::Shape ref_shape = {1, 3, 4, 2};
+    ptrdiff_t ref_offset_elems = 7;
+    ptrdiff_t ref_offset_bytes = ref_offset_elems * ov::element::i32.size();
+    ov::Strides ref_strides = {90, 30, 5, 1};
+    ASSERT_EQ(roi_tensor.get_shape(), ref_shape);
+    ASSERT_EQ(roi_tensor.data<int32_t>() - t.data<int32_t>(), ref_offset_elems);
+    ASSERT_EQ(reinterpret_cast<uint8_t*>(roi_tensor.data()) - reinterpret_cast<uint8_t*>(t.data()), ref_offset_bytes);
+    ASSERT_EQ(roi_tensor.get_strides(), t.get_strides());
+    ASSERT_EQ(byteStrides(ref_strides, roi_tensor.get_element_type()), roi_tensor.get_strides());
+    ASSERT_EQ(roi_tensor.get_element_type(), t.get_element_type());
+}
+
+TEST_F(OVTensorTest, makeRangeRoiStringTensor) {
+    ov::Tensor t{ov::element::string, {1, 3, 6, 5}};  // RGBp picture of size (WxH) = 5x6
+    ov::Tensor roi_tensor{t, {0, 0, 1, 2}, {1, 3, 5, 4}};
+    ov::Shape ref_shape = {1, 3, 4, 2};
+    ptrdiff_t ref_offset_elems = 7;
+    ptrdiff_t ref_offset_bytes = ref_offset_elems * string_size;
+    ov::Strides ref_strides = {90, 30, 5, 1};
+    ASSERT_EQ(roi_tensor.get_shape(), ref_shape);
+    ASSERT_EQ(roi_tensor.data<std::string>() - t.data<std::string>(), ref_offset_elems);
+    ASSERT_EQ(reinterpret_cast<uint8_t*>(roi_tensor.data()) - reinterpret_cast<uint8_t*>(t.data()), ref_offset_bytes);
+    ASSERT_EQ(roi_tensor.get_strides(), t.get_strides());
+    ASSERT_EQ(byteStrides(ref_strides, roi_tensor.get_element_type()), roi_tensor.get_strides());
+    ASSERT_EQ(roi_tensor.get_element_type(), t.get_element_type());
+}
+
+TEST_F(OVTensorTest, expandRankKeepsStridesRankOnRoiTensor) {
+    ov::Tensor owner{ov::element::i32, {2, 3, 4}};
+    ov::Tensor roi{owner, {0, 1, 1}, {2, 3, 3}};
+
+    roi.set_shape({1, 1, 2, 2, 2});
+
+    ASSERT_EQ(roi.get_shape(), ov::Shape({1, 1, 2, 2, 2}));
+    ASSERT_EQ(roi.get_strides(), ov::Strides({96, 96, 48, 16, 4}));
+}
+
+TEST_F(OVTensorTest, copyToRoiTensorWithExpandedRank) {
+    ov::Tensor owner{ov::element::i64, {4}};
+    ov::Tensor roi{owner, {2}, {3}};
+    ov::Tensor src{ov::element::i64, {1, 1}};
+    src.data<int64_t>()[0] = 42;
+
+    src.copy_to(roi);
+
+    ASSERT_EQ(roi.get_shape(), ov::Shape({1, 1}));
+    ASSERT_EQ(roi.get_strides().size(), roi.get_shape().size());
+    ASSERT_EQ(owner.data<int64_t>()[2], 42);
+}
+
+TEST_F(OVTensorTest, copyStridedRoiTensorWithExpandedRank) {
+    ov::Tensor owner{ov::element::i32, {2, 3, 4}};
+    ov::Tensor roi{owner, {0, 1, 1}, {2, 3, 3}};  // not continuous along the two inner dimensions
+    ov::Tensor src{ov::element::i32, {1, 2, 2, 2}};
+
+    src.copy_to(roi);
+
+    ASSERT_EQ(roi.get_strides().size(), roi.get_shape().size());
+    const auto* expected = src.data<int32_t>();
+    const auto* result = owner.data<int32_t>();
+    std::vector<int32_t> roi_area;
+    for (const size_t idx : {5, 6, 9, 10, 17, 18, 21, 22}) {
+        roi_area.push_back(result[idx]);
+    }
+    ASSERT_EQ(roi_area, std::vector<int32_t>(expected, expected + 8));
+
+    // The expanded ROI must also read back correctly as a copy source.
+    ov::Tensor dst{ov::element::i32, {1, 2, 2, 2}};
+    roi.copy_to(dst);
+    ASSERT_EQ(std::memcmp(dst.data(), src.data(), src.get_byte_size()), 0);
+}
+
+TEST_F(OVTensorTest, expandRankOnScalarRoiTensor) {
+    ov::Tensor owner{ov::element::i32, ov::Shape{}};
+    ov::Tensor roi{owner, {}, {}};
+
+    roi.set_shape({1, 1});
+
+    ASSERT_EQ(roi.get_shape(), ov::Shape({1, 1}));
+    ASSERT_EQ(roi.get_strides(), ov::Strides({4, 4}));
+}
+
+TEST_F(OVTensorTest, expandRankOnSubByteRoiTensor) {
+    ov::Tensor owner{ov::element::u4, {2, 8}};
+    ov::Tensor row{owner, {1, 0}, {2, 8}};
+    ov::Tensor vector_owner{ov::element::u4, {8}};
+    ov::Tensor vector{vector_owner, {0}, {8}};
+
+    row.set_shape({1, 1, 8});
+    vector.set_shape({1, 1, 8});
+
+    ASSERT_EQ(row.get_strides(), ov::Strides({4, 4, 1}));
+    ASSERT_EQ(vector.get_strides(), ov::Strides({4, 4, 1}));
+    ASSERT_TRUE(vector.is_continuous());
+}
+
+TEST_F(OVTensorTest, setSmallerShapeOnRoiTensor) {
+    ov::Tensor t{ov::element::i32, {1, 3, 6, 5}};
+    ov::Tensor roi_tensor{t, {0, 0, 1, 2}, {1, 2, 5, 4}};
+    const ov::Shape newShape({1, 1, 3, 2});
+
+    ASSERT_EQ(roi_tensor.get_shape(), ov::Shape({1, 2, 4, 2}));
+
+    roi_tensor.set_shape(newShape);
+    ASSERT_EQ(roi_tensor.get_shape(), newShape);
+}
+
+TEST_F(OVTensorTest, setMaxSizeShapeOnRoiTensor) {
+    ov::Tensor t{ov::element::i32, {1, 3, 6, 5}};
+    ov::Tensor roi_tensor{t, {0, 0, 1, 2}, {1, 2, 5, 5}};
+    const ov::Shape new_shape({1, 2, 1, 1});
+    const ov::Shape roi_capacity({1, 2, 4, 3});
+
+    ASSERT_EQ(roi_tensor.get_shape(), roi_capacity);
+
+    roi_tensor.set_shape(new_shape);
+    ASSERT_EQ(roi_tensor.get_shape(), new_shape);
+
+    roi_tensor.set_shape(roi_capacity);
+    ASSERT_EQ(roi_tensor.get_shape(), roi_capacity);
+}
+
+TEST_F(OVTensorTest, setShapeGtMaxOnRoiTensor) {
+    ov::Tensor t{ov::element::i32, {1, 3, 6, 5}};
+    ov::Tensor roi_tensor{t, {0, 0, 1, 2}, {1, 2, 5, 5}};
+    const ov::Shape newShape({0, 0, 0, 0});
+
+    roi_tensor.set_shape(newShape);
+    ASSERT_EQ(roi_tensor.get_shape(), newShape);
+}
+
+TEST_F(OVTensorTest, setMinShapeOnRoiTensor) {
+    ov::Tensor t{ov::element::i32, {1, 3, 6, 5}};
+    ov::Tensor roi_tensor{t, {0, 0, 1, 2}, {1, 2, 5, 5}};
+    const ov::Shape newShape({1, 3, 6, 3});  // ROI coordinate begin + newShape[2] is bigger than t.shape[2]
+
+    ASSERT_EQ(roi_tensor.get_shape(), ov::Shape({1, 2, 4, 3}));
+    ASSERT_THROW(roi_tensor.set_shape(newShape), ov::Exception);
+}
+
+TEST_F(OVTensorTest, cannotSetShapeOnRoiTensor) {
+    ov::Tensor t{ov::element::i32, {1, 3, 6, 5}};  // RGBp picture of size (WxH) = 5x6
+    ov::Tensor roi_tensor{t, {0, 0, 1, 2}, {1, 3, 5, 4}};
+    const ov::Shape newShape({4, 5, 6});
+
+    ASSERT_THROW(roi_tensor.set_shape(newShape), ov::Exception);
+}
+
+TEST_F(OVTensorTest, setShapeExpandRoiRank) {
+    ov::Tensor t{ov::element::i32, {16, 16}};
+    std::iota(t.data<int32_t>(), t.data<int32_t>() + t.get_size(), 1);
+    ov::Tensor roi_tensor{t, {0, 0}, {3, 3}};
+
+    EXPECT_NO_THROW(roi_tensor.set_shape({1, 1, 2}));
+    EXPECT_EQ(roi_tensor.get_shape(), ov::Shape({1, 1, 2}));
+    EXPECT_NO_THROW(roi_tensor.set_shape({1, 1, 2, 2}));
+    EXPECT_EQ(roi_tensor.get_shape(), ov::Shape({1, 1, 2, 2}));
+}
+
+TEST_F(OVTensorTest, setShapeInvalidExpandRoiRank) {
+    ov::Tensor t{ov::element::i32, {16, 16}};
+    std::iota(t.data<int32_t>(), t.data<int32_t>() + t.get_size(), 1);
+    ov::Tensor roi_tensor{t, {0, 0}, {2, 2}};
+
+    OV_EXPECT_THROW(roi_tensor.set_shape({1, 2, 1, 2, 2}), ov::Exception, _);
+    OV_EXPECT_THROW(roi_tensor.set_shape({2, 1, 1}), ov::Exception, _);
+    OV_EXPECT_THROW(roi_tensor.set_shape({2, 1, 1, 1}), ov::Exception, _);
+    OV_EXPECT_THROW(roi_tensor.set_shape({2}), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, cannotSetShapeOnRoiStringTensor) {
+    ov::Tensor t{ov::element::string, {1, 3, 6, 5}};  // RGBp picture of size (WxH) = 5x6
+    ov::Tensor roi_tensor{t, {0, 0, 1, 2}, {1, 3, 5, 4}};
+    const ov::Shape newShape({4, 5, 6});
+
+    ASSERT_THROW(roi_tensor.set_shape(newShape), ov::Exception);
+}
+
+TEST_F(OVTensorTest, tensorInt4DataAccess) {
+    ov::Tensor t{ov::element::i4, {1, 6, 5, 3}};  // RGB picture of size (WxH) = 5x6
+    ASSERT_THROW((ov::Tensor{t, {0, 1, 2, 0}, {1, 5, 4, 3}}), ov::Exception);
+    ASSERT_THROW(t.get_strides(), ov::Exception);
+    ASSERT_THROW(t.data<int8_t>(), ov::Exception);
+    OV_ASSERT_NO_THROW(t.data());
+}
+
+TEST_F(OVTensorTest, roiLpCropOuterDim) {
+    ov::Tensor t{ov::element::i4, {4, 512}};
+    auto* raw = reinterpret_cast<uint8_t*>(t.data());
+    std::iota(raw, raw + t.get_byte_size(), uint8_t{0});
+
+    ov::Tensor roi;
+    OV_ASSERT_NO_THROW(roi = ov::Tensor(t, {1, 0}, {3, 512}));
+
+    EXPECT_EQ(roi.get_shape(), ov::Shape({2, 512}));
+    EXPECT_EQ(roi.get_element_type(), t.get_element_type());
+    const auto expected_offset_bytes = 512 * 4 / 8;
+    EXPECT_EQ(reinterpret_cast<const uint8_t*>(roi.data()) - reinterpret_cast<const uint8_t*>(t.data()),
+              expected_offset_bytes);
+    EXPECT_EQ(0, std::memcmp(roi.data(), raw + expected_offset_bytes, roi.get_byte_size()));
+}
+
+TEST_F(OVTensorTest, roiLpWindowFromStart) {
+    ov::Tensor t{ov::element::i4, {1, 1, 4095, 512}};
+    ov::Tensor roi;
+    OV_ASSERT_NO_THROW(roi = ov::Tensor(t, {0, 0, 0, 0}, {1, 1, 10, 512}));
+
+    EXPECT_EQ(roi.get_shape(), ov::Shape({1, 1, 10, 512}));
+    EXPECT_EQ(roi.data(), t.data());
+}
+
+TEST_F(OVTensorTest, roiLpStridedTwoHeadsSucceeds) {
+    ov::Tensor t{ov::element::i4, {1, 2, 4095, 512}};
+    auto raw = reinterpret_cast<uint8_t*>(t.data());
+    const size_t row_bytes = 512 * 4 / 8;
+    const size_t head_stride_bytes = 4095 * row_bytes;
+    // offset each head's pattern by a different constant so the two heads can never alias
+    for (size_t i = 0; i < t.get_byte_size(); ++i) {
+        raw[i] = static_cast<uint8_t>(i + i / head_stride_bytes);
+    }
+
+    ov::Tensor roi;
+    OV_ASSERT_NO_THROW(roi = ov::Tensor(t, {0, 0, 0, 0}, {1, 2, 10, 512}));
+
+    EXPECT_EQ(roi.get_shape(), ov::Shape({1, 2, 10, 512}));
+    EXPECT_EQ(roi.get_strides(), t.get_strides());
+    EXPECT_FALSE(roi.is_continuous());
+
+    EXPECT_EQ(roi.get_strides()[1], head_stride_bytes);
+    // guards against a future shape change making the two heads indistinguishable again
+    ASSERT_NE(0, std::memcmp(raw, raw + head_stride_bytes, row_bytes));
+
+    auto roi_data = reinterpret_cast<const uint8_t*>(roi.data());
+    EXPECT_EQ(0, std::memcmp(roi_data, raw, 10 * row_bytes));
+    EXPECT_EQ(0, std::memcmp(roi_data + head_stride_bytes, raw + head_stride_bytes, 10 * row_bytes));
+
+    ov::Tensor dense{ov::element::i4, {1, 2, 10, 512}};
+    OV_ASSERT_NO_THROW(roi.copy_to(dense));
+    auto dense_data = reinterpret_cast<uint8_t*>(dense.data());
+    EXPECT_EQ(0, std::memcmp(dense_data, raw, 10 * row_bytes));
+    EXPECT_EQ(0, std::memcmp(dense_data + 10 * row_bytes, raw + head_stride_bytes, 10 * row_bytes));
+}
+
+TEST_F(OVTensorTest, roiLpCopyToStridedDestinationSucceeds) {
+    ov::Tensor src_owner{ov::element::i4, {1, 2, 4095, 512}};
+    auto src_raw = reinterpret_cast<uint8_t*>(src_owner.data());
+    const size_t row_bytes = 512 * 4 / 8;
+    const size_t src_head_stride_bytes = 4095 * row_bytes;
+    for (size_t i = 0; i < src_owner.get_byte_size(); ++i) {
+        src_raw[i] = static_cast<uint8_t>(i + i / src_head_stride_bytes);
+    }
+    ov::Tensor src;
+    OV_ASSERT_NO_THROW(src = ov::Tensor(src_owner, {0, 0, 0, 0}, {1, 2, 10, 512}));
+
+    ov::Tensor dst_owner{ov::element::i4, {1, 3, 4095, 512}};
+    auto dst_owner_raw = reinterpret_cast<uint8_t*>(dst_owner.data());
+    std::fill(dst_owner_raw, dst_owner_raw + dst_owner.get_byte_size(), uint8_t{0xFF});
+    const size_t dst_head_stride_bytes = 4095 * row_bytes;
+
+    ov::Tensor dst;
+    // heads 1 and 2 of dst_owner - both src and dst are non-contiguous, with different strides
+    OV_ASSERT_NO_THROW(dst = ov::Tensor(dst_owner, {0, 1, 0, 0}, {1, 3, 10, 512}));
+    EXPECT_FALSE(dst.is_continuous());
+
+    OV_ASSERT_NO_THROW(src.copy_to(dst));
+
+    // head 0 of dst_owner is outside the destination ROI and must stay untouched
+    EXPECT_EQ(dst_owner_raw[0], 0xFF);
+    EXPECT_EQ(dst_owner_raw[dst_head_stride_bytes - 1], 0xFF);
+
+    EXPECT_EQ(0, std::memcmp(dst_owner_raw + dst_head_stride_bytes, src_raw, 10 * row_bytes));
+    // row just past the copied window must stay untouched
+    EXPECT_EQ(dst_owner_raw[dst_head_stride_bytes + 10 * row_bytes], 0xFF);
+
+    EXPECT_EQ(0,
+              std::memcmp(dst_owner_raw + 2 * dst_head_stride_bytes, src_raw + src_head_stride_bytes, 10 * row_bytes));
+    EXPECT_EQ(dst_owner_raw[2 * dst_head_stride_bytes + 10 * row_bytes], 0xFF);
+}
+
+TEST_F(OVTensorTest, roiLpCopyToDenseSourceStridedDestinationSucceeds) {
+    ov::Tensor src{ov::element::i4, {1, 2, 10, 512}};
+    auto src_raw = reinterpret_cast<uint8_t*>(src.data());
+    const size_t row_bytes = 512 * 4 / 8;
+    const size_t src_head_stride_bytes = 10 * row_bytes;
+    for (size_t i = 0; i < src.get_byte_size(); ++i) {
+        src_raw[i] = static_cast<uint8_t>(i + i / src_head_stride_bytes);
+    }
+
+    ov::Tensor dst_owner{ov::element::i4, {1, 2, 4095, 512}};
+    auto dst_owner_raw = reinterpret_cast<uint8_t*>(dst_owner.data());
+    std::fill(dst_owner_raw, dst_owner_raw + dst_owner.get_byte_size(), uint8_t{0xFF});
+    const size_t dst_head_stride_bytes = 4095 * row_bytes;
+
+    ov::Tensor dst;
+    OV_ASSERT_NO_THROW(dst = ov::Tensor(dst_owner, {0, 0, 0, 0}, {1, 2, 10, 512}));
+    EXPECT_FALSE(dst.is_continuous());
+
+    OV_ASSERT_NO_THROW(src.copy_to(dst));
+
+    EXPECT_EQ(0, std::memcmp(dst_owner_raw, src_raw, 10 * row_bytes));
+    // row just past the copied window must stay untouched
+    EXPECT_EQ(dst_owner_raw[10 * row_bytes], 0xFF);
+
+    EXPECT_EQ(0, std::memcmp(dst_owner_raw + dst_head_stride_bytes, src_raw + src_head_stride_bytes, 10 * row_bytes));
+    EXPECT_EQ(dst_owner_raw[dst_head_stride_bytes + 10 * row_bytes], 0xFF);
+}
+
+TEST_F(OVTensorTest, roiLpCopyToMismatchedElementTypeThrows) {
+    ov::Tensor src{ov::element::i4, {2, 8}};
+    ov::Tensor dst{ov::element::u4, {2, 8}};
+    OV_EXPECT_THROW_HAS_SUBSTRING(src.copy_to(dst), ov::Exception, "Tensor element types are not equal");
+}
+
+TEST_F(OVTensorTest, roiLpCopyToUninitializedDestinationThrows) {
+    ov::Tensor src{ov::element::i4, {2, 8}};
+    ov::Tensor dst;
+    OV_EXPECT_THROW_HAS_SUBSTRING(src.copy_to(dst), ov::Exception, "Destination tensor was not initialized");
+}
+
+TEST_F(OVTensorTest, roiLpCopyToExceedsDestinationCapacityThrows) {
+    ov::Tensor src{ov::element::i4, {1, 2, 10, 512}};
+    ov::Tensor dst_owner{ov::element::i4, {1, 2, 4095, 512}};
+    ov::Tensor dst;
+    // dst sits at the tail of dim2, leaving no room to grow to src's shape (10 rows needed, 5 available)
+    OV_ASSERT_NO_THROW(dst = ov::Tensor(dst_owner, {0, 0, 4090, 0}, {1, 2, 4095, 512}));
+
+    OV_EXPECT_THROW(src.copy_to(dst), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, roiLpCopyToZeroExtentMiddleDimDoesNotHang) {
+    ov::Tensor owner{ov::element::i4, {2, 3, 8}};
+    ov::Tensor src;
+    OV_ASSERT_NO_THROW(src = ov::Tensor(owner, {0, 0, 0}, {2, 0, 8}));
+    ASSERT_EQ(src.get_shape(), ov::Shape({2, 0, 8}));
+    ASSERT_EQ(src.get_strides(), ov::Strides({12, 4, 1}));
+
+    ov::Tensor dst{ov::element::i4, {1}};
+    OV_ASSERT_NO_THROW(src.copy_to(dst));
+    EXPECT_EQ(dst.get_shape(), ov::Shape({2, 0, 8}));
+    EXPECT_EQ(dst.get_byte_size(), 0u);
+    EXPECT_EQ(dst.get_strides(), ov::Strides({0, 4, 1}));
+}
+
+TEST_F(OVTensorTest, roiLpInnerDimSliceThrows) {
+    ov::Tensor t{ov::element::i4, {2, 8}};
+    OV_EXPECT_THROW_HAS_SUBSTRING((ov::Tensor{t, {0, 0}, {2, 4}}),
+                                  ov::Exception,
+                                  "cannot slice the innermost dimension");
+}
+
+TEST_F(OVTensorTest, roiLpNonContiguousThrows) {
+    ov::Tensor t{ov::element::i4, {1, 2, 4095, 512}};
+    // end[2] exceeds the owner's shape[2] (4095) - still rejected regardless of element type
+    OV_EXPECT_THROW((ov::Tensor{t, {0, 0, 0, 0}, {1, 2, 4096, 512}}), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, roiLpUnsupportedBitwidthThrows) {
+    ov::Tensor t3{ov::element::u3, {2, 8}};
+    OV_EXPECT_THROW_HAS_SUBSTRING((ov::Tensor{t3, {0, 0}, {1, 8}}),
+                                  ov::Exception,
+                                  "Could not get strides for tensor type: u3");
+
+    ov::Tensor t6{ov::element::u6, {2, 8}};
+    OV_EXPECT_THROW_HAS_SUBSTRING((ov::Tensor{t6, {0, 0}, {1, 8}}),
+                                  ov::Exception,
+                                  "Could not get strides for tensor type: u6");
+}
+
+TEST_F(OVTensorTest, roiLpUnalignedInnerDimThrows) {
+    ov::Tensor t{ov::element::i4, {1, 6, 5, 3}};
+    OV_EXPECT_THROW_HAS_SUBSTRING((ov::Tensor{t, {0, 1, 2, 0}, {1, 5, 4, 3}}),
+                                  ov::Exception,
+                                  "Could not get strides for tensor type: i4, shape: [1,6,5,3]");
+}
+
+TEST_F(OVTensorTest, roiLpDirectStridedViewSucceeds) {
+    constexpr size_t row_bytes = 512 * 4 / 8;
+    constexpr size_t head_stride_bytes = 4095 * row_bytes;
+    std::vector<uint8_t> buffer(2 * head_stride_bytes);
+    // offset each head's pattern by a different constant so the two heads can never alias
+    for (size_t i = 0; i < buffer.size(); ++i) {
+        buffer[i] = static_cast<uint8_t>(i + i / head_stride_bytes);
+    }
+
+    const ov::Strides strides{2 * head_stride_bytes, head_stride_bytes, row_bytes, 1};
+    ov::Tensor t;
+    OV_ASSERT_NO_THROW(t = ov::Tensor(ov::element::i4, {1, 2, 10, 512}, buffer.data(), strides));
+
+    EXPECT_EQ(t.get_strides(), strides);
+    EXPECT_FALSE(t.is_continuous());
+
+    auto data = reinterpret_cast<const uint8_t*>(t.data());
+    EXPECT_EQ(0, std::memcmp(data, buffer.data(), 10 * row_bytes));
+    EXPECT_EQ(0, std::memcmp(data + head_stride_bytes, buffer.data() + head_stride_bytes, 10 * row_bytes));
+
+    ov::Tensor dense{ov::element::i4, {1, 2, 10, 512}};
+    OV_ASSERT_NO_THROW(t.copy_to(dense));
+    auto dense_data = reinterpret_cast<uint8_t*>(dense.data());
+    EXPECT_EQ(0, std::memcmp(dense_data, buffer.data(), 10 * row_bytes));
+    EXPECT_EQ(0, std::memcmp(dense_data + 10 * row_bytes, buffer.data() + head_stride_bytes, 10 * row_bytes));
+}
+
+TEST_F(OVTensorTest, roiLpDirectStridedViewRowTooSmallThrows) {
+    constexpr size_t row_bytes = 512 * 4 / 8;
+    std::vector<uint8_t> buffer(2 * 10 * row_bytes);
+    const ov::Strides bad_strides{2 * 10 * row_bytes, 10 * row_bytes, row_bytes - 1, 1};
+    OV_EXPECT_THROW((ov::Tensor(ov::element::i4, {1, 2, 10, 512}, buffer.data(), bad_strides)), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, roiLpDirectStridedViewWrongPlaceholderStrideThrows) {
+    constexpr size_t row_bytes = 8 * 4 / 8;  // i4, 8 elements per row -> 4 bytes
+    std::vector<uint8_t> buffer(2 * row_bytes);
+    const ov::Strides bad_strides{row_bytes, 2};  // last stride must be the dense placeholder (1), not 2
+    OV_EXPECT_THROW((ov::Tensor(ov::element::i4, {2, 8}, buffer.data(), bad_strides)), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, roiLpDirectStridedViewWrongPlaceholderStride3DThrows) {
+    constexpr size_t row_bytes = 8 * 4 / 8;  // i4, 8 elements per row -> 4 bytes
+    std::vector<uint8_t> buffer(2 * 4 * row_bytes);
+    const ov::Strides bad_strides{4 * row_bytes, row_bytes, 2};  // last stride must be 1, not 2
+    OV_EXPECT_THROW((ov::Tensor(ov::element::i4, {2, 4, 8}, buffer.data(), bad_strides)), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, stridedViewSetShapeRejectsUnalignedSubByteShape) {
+    constexpr size_t row_bytes = 8 * 4 / 8;
+    std::vector<uint8_t> buffer(2 * row_bytes);
+    ov::Tensor t{ov::element::i4, {2, 8}, buffer.data(), ov::Strides{row_bytes, 1}};
+    // shrinking the last dimension to 1 element (4 bits) is no longer byte-aligned
+    OV_EXPECT_THROW(t.set_shape({2, 1}), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, roiSetShapeRejectsUnalignedSubByteInnerDim) {
+    ov::Tensor owner{ov::element::i4, {4, 8}};
+    ov::Tensor roi{owner, {0, 0}, {2, 8}};
+    // shrinking the last dimension to 1 element (4 bits) is no longer byte-aligned
+    OV_EXPECT_THROW(roi.set_shape({2, 1}), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, roiSetShapeRejectsUnalignedSubByteInnerDimWithRankExpansion) {
+    ov::Tensor owner{ov::element::i4, {4, 8}};
+    ov::Tensor roi{owner, {0, 0}, {2, 8}};
+    // expanding rank must not bypass the innermost byte-alignment check
+    OV_EXPECT_THROW(roi.set_shape({1, 2, 1}), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, makeRangeRoiBlobWrongSize) {
+    ov::Tensor t{ov::element::f32, {1, 3, 4, 4}};
+    ASSERT_THROW((ov::Tensor{t, {0, 0, 1, 1}, {1, 3, 5, 5}}), ov::Exception);
+    ASSERT_THROW((ov::Tensor{t, {0, 0, 1, 1, 3}, {1, 3, 4, 4}}), ov::Exception);
+}
+
+TEST_F(OVTensorTest, readRangeRoiBlob) {
+    ov::Tensor t{ov::element::i32, {1, 3, 4, 8}};
+    {
+        const auto origPtr = t.data<int32_t>();
+        ASSERT_NE(nullptr, origPtr);
+        for (size_t i = 0; i < t.get_size(); ++i) {
+            origPtr[i] = static_cast<int32_t>(i);
+        }
+    }
+    ov::Tensor roi_tensor{t, {0, 0, 2, 4}, {1, 3, 4, 8}};
+    ASSERT_NE(false, static_cast<bool>(roi_tensor));
+    {
+        const std::uint8_t* roi = reinterpret_cast<const std::uint8_t*>(roi_tensor.data());
+        ASSERT_NE(nullptr, roi);
+        auto strides = roi_tensor.get_strides();
+        for (auto&& c : ov::CoordinateTransformBasic{roi_tensor.get_shape()}) {
+            auto actual_addr = roi + c[3] * strides[3] + c[2] * strides[2] + c[1] * strides[1] + c[0] * strides[0];
+            auto expected_addr = t.data<int32_t>() + ((c[3] + 4) * strides[3] + (c[2] + 2) * strides[2] +
+                                                      (c[1] + 0) * strides[1] + (c[0] + 0) * strides[0]) /
+                                                         t.get_element_type().size();
+            ASSERT_EQ(actual_addr, reinterpret_cast<const std::uint8_t*>(expected_addr));
+        }
+    }
+}
+
+TEST_F(OVTensorTest, readRangeRoiBlobStringTensor) {
+    ov::Tensor t{ov::element::string, {1, 3, 4, 8}};
+    {
+        const auto origPtr = t.data<std::string>();
+        ASSERT_NE(nullptr, origPtr);
+        for (size_t i = 0; i < t.get_size(); ++i) {
+            origPtr[i] = std::to_string(i);
+        }
+    }
+    ov::Tensor roi_tensor{t, {0, 0, 2, 4}, {1, 3, 4, 8}};
+    ASSERT_NE(false, static_cast<bool>(roi_tensor));
+    {
+        const std::uint8_t* roi = static_cast<const std::uint8_t*>(roi_tensor.data());
+        ASSERT_NE(nullptr, roi);
+        auto strides = roi_tensor.get_strides();
+        for (auto&& c : ov::CoordinateTransformBasic{roi_tensor.get_shape()}) {
+            auto actual_addr = roi + c[3] * strides[3] + c[2] * strides[2] + c[1] * strides[1] + c[0] * strides[0];
+            auto expected_addr = t.data<std::string>() + ((c[3] + 4) * strides[3] + (c[2] + 2) * strides[2] +
+                                                          (c[1] + 0) * strides[1] + (c[0] + 0) * strides[0]) /
+                                                             t.get_element_type().size();
+            ASSERT_EQ(actual_addr, static_cast<uint8_t*>(static_cast<void*>(expected_addr)));
+        }
+    }
+}
+
+using EmptyRoiParams = std::pair<ov::Coordinate, ov::Coordinate>;
+
+struct OVTensorTestCopyEmptyRoi : ::testing::TestWithParam<EmptyRoiParams> {};
+
+TEST_P(OVTensorTestCopyEmptyRoi, copy_to_and_from_dense) {
+    const auto& [begin, end] = GetParam();
+    ov::Tensor parent{ov::element::f32, {1, 4, 8, 16}};
+    ov::Tensor roi{parent, begin, end};
+    ov::Tensor dense{ov::element::f32, {1}};
+
+    OV_ASSERT_NO_THROW(roi.copy_to(dense));
+    EXPECT_EQ(dense.get_shape(), roi.get_shape());
+    OV_ASSERT_NO_THROW(dense.copy_to(roi));
+}
+
+INSTANTIATE_TEST_SUITE_P(copy_tests_empty_roi,
+                         OVTensorTestCopyEmptyRoi,
+                         ::testing::Values(EmptyRoiParams{{0, 0, 2, 0}, {1, 4, 2, 16}},   // 1x4x0x16
+                                           EmptyRoiParams{{0, 0, 2, 4}, {1, 4, 2, 8}},    // 1x4x0x4
+                                           EmptyRoiParams{{0, 0, 0, 4}, {1, 4, 8, 4}}));  // 1x4x8x0
+
+TEST_F(OVTensorTest, createTensorWithZeroDimsCheckStride) {
+    ov::Shape shape = {0, 0, 0, 0};
+    auto tensor = ov::Tensor(ov::element::f32, shape);
+    EXPECT_EQ(!!tensor, true);
+    auto stride = tensor.get_strides();
+    EXPECT_EQ(stride.size(), shape.size());
+    EXPECT_EQ(stride.back(), 0);
+    EXPECT_EQ(tensor.is_continuous(), true);
+}
+
+TEST_F(OVTensorTest, getByteSizeU2LessThanMinStorageUnit) {
+    const auto tensor = ov::Tensor(ov::element::u2, ov::Shape{3});
+    EXPECT_EQ(tensor.get_byte_size(), 1);
+}
+
+TEST_F(OVTensorTest, getByteSizeU2EvenDivByStorageUnit) {
+    const auto tensor = ov::Tensor(ov::element::u2, ov::Shape{16});
+    EXPECT_EQ(tensor.get_byte_size(), 4);
+}
+
+TEST_F(OVTensorTest, getByteSizeU2NotEvenDivByStorageUnit) {
+    const auto tensor = ov::Tensor(ov::element::u2, ov::Shape{17});
+    EXPECT_EQ(tensor.get_byte_size(), 5);
+}
+
+TEST_F(OVTensorTest, getByteSizeU3SmallShapeWithTailBits) {
+    const auto tensor = ov::Tensor(ov::element::u3, ov::Shape{3});
+    EXPECT_EQ(tensor.get_byte_size(), 2);
+}
+
+TEST_F(OVTensorTest, getByteSizeU3ShapeWithoutTailBits) {
+    const auto tensor = ov::Tensor(ov::element::u3, ov::Shape{16});
+    EXPECT_EQ(tensor.get_byte_size(), 2 * 3);
+}
+
+TEST_F(OVTensorTest, getByteSizeU3LargeShapeWithTailBits) {
+    const auto tensor = ov::Tensor(ov::element::u3, ov::Shape{17});
+    EXPECT_EQ(tensor.get_byte_size(), 7);
+}
+
+TEST_F(OVTensorTest, getByteSizeU6SmallShapeWithTailBits) {
+    const auto tensor = ov::Tensor(ov::element::u6, ov::Shape{3});
+    EXPECT_EQ(tensor.get_byte_size(), 3);
+}
+
+TEST_F(OVTensorTest, getByteSizeU6ShapeWithoutTailBits) {
+    const auto tensor = ov::Tensor(ov::element::u6, ov::Shape{16});
+    EXPECT_EQ(tensor.get_byte_size(), 4 * 3);
+}
+
+TEST_F(OVTensorTest, getByteSizeU6LargeShapeWithTailBits) {
+    const auto tensor = ov::Tensor(ov::element::u6, ov::Shape{17});
+    EXPECT_EQ(tensor.get_byte_size(), 13);
+}
+
+TEST_F(OVTensorTest, checkIsContinuousTensorScalar) {
+    ov::Tensor tensor(ov::element::f32, ov::Shape{});
+    auto data = tensor.data();
+    auto strides = tensor.get_strides();
+
+    ov::Tensor view_tensor(ov::element::f32, ov::Shape{}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+}
+
+TEST_F(OVTensorTest, checkIsContinuousTensor1Dimension) {
+    ov::Tensor tensor(ov::element::f32, ov::Shape{128});
+    auto data = tensor.data();
+    auto strides = tensor.get_strides();
+
+    ov::Tensor view_tensor;
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{16}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+}
+
+TEST_F(OVTensorTest, checkIsContinuousTensor2Dimensions) {
+    ov::Tensor tensor(ov::element::f32, ov::Shape{32, 128});
+    auto data = tensor.data();
+    auto strides = tensor.get_strides();
+
+    ov::Tensor view_tensor;
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{16, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 16}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{2, 16}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), false);
+}
+
+TEST_F(OVTensorTest, checkIsContinuousTensor3Dimensions) {
+    ov::Tensor tensor(ov::element::f32, ov::Shape{5, 32, 128});
+    auto data = tensor.data();
+    auto strides = tensor.get_strides();
+
+    ov::Tensor view_tensor;
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{2, 32, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{2, 16, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), false);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 1, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 1, 64}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 16, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+}
+
+TEST_F(OVTensorTest, checkIsContinuousTensor4Dimensions) {
+    const ov::Tensor tensor(ov::element::f32, ov::Shape{3, 5, 32, 128});
+    auto data = tensor.data();
+    auto strides = tensor.get_strides();
+
+    ov::Tensor view_tensor;
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 2, 32, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{2, 5, 32, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{2, 2, 32, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), false);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 2, 5, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), false);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{3, 5, 32, 64}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), false);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 1, 16, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{2, 1, 16, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), false);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 1, 1, 128}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+
+    view_tensor = ov::Tensor(ov::element::f32, ov::Shape{1, 1, 1, 32}, data, strides);
+    EXPECT_EQ(view_tensor.is_continuous(), true);
+}
+
+TEST_F(OVTensorTest, createReadOnlyView) {
+    const std::vector<int32_t> data(10, 1);
+    ov::Tensor data_view(ov::element::i32, ov::Shape{10}, data.data());
+
+    OV_ASSERT_NO_THROW(static_cast<const Tensor&>(data_view).data(element::i32));
+    OV_ASSERT_NO_THROW(data_view.data<const int32_t>());
+    OV_EXPECT_THROW(data_view.data<int64_t>(), ov::Exception, HasSubstr("Can not access non-const pointer"));
+}
+
+TEST_F(OVTensorTest, createReadOnlyViewFromNullptr) {
+    OV_EXPECT_THROW(Tensor(ov::element::i32, ov::Shape{10}, static_cast<const void*>(nullptr)), ov::Exception, _);
+}
+
+TEST_F(OVTensorTest, createAllocationOverflow) {
+    OV_EXPECT_THROW(Tensor(element::i32, Shape{std::numeric_limits<size_t>::max()}),
+                    Exception,
+                    HasSubstr("Cannot allocate memory"));
+    OV_EXPECT_THROW(Tensor(element::i32, Shape{std::numeric_limits<size_t>::max(), 2}),
+                    Exception,
+                    HasSubstr("Cannot allocate memory"));
+}
+
+TEST_F(OVTensorTest, getTensorDataOffsetFromRoiTensor) {
+    const ov::Tensor tensor(ov::element::f32, ov::Shape{3, 5, 32, 128});
+    ov::Tensor roi_tensor;
+    OV_ASSERT_NO_THROW(roi_tensor = ov::Tensor(tensor, {1, 2, 5, 64}, {2, 3, 10, 128}));
+    size_t tensor_data_offset = ov::get_tensor_data_offset(*ov::get_tensor_impl(roi_tensor)._ptr);
+    EXPECT_EQ(static_cast<const uint8_t*>(roi_tensor.data()),
+              static_cast<const uint8_t*>(tensor.data()) + tensor_data_offset);
+}
+
+TEST_F(OVTensorTest, getTensorDataOffsetFromGeneralTensor) {
+    const ov::Tensor tensor(ov::element::f32, ov::Shape{3, 5, 32, 128});
+    size_t tensor_data_offset = ov::get_tensor_data_offset(*ov::get_tensor_impl(tensor)._ptr);
+    EXPECT_EQ(static_cast<const uint8_t*>(tensor.data()),
+              static_cast<const uint8_t*>(tensor.data()) + tensor_data_offset);
+    EXPECT_EQ(0, tensor_data_offset);  // special case for general tensor it returns 0
+}
+
+struct TestParams {
+    ov::Shape src_shape;
+    ov::Strides src_strides;
+    ov::Shape dst_shape;
+    ov::Strides dst_strides;
+};
+
+struct OVTensorTestCopy : ::testing::TestWithParam<std::tuple<ov::element::Type, TestParams>> {};
+
+namespace {
+template <class T>
+std::vector<T> fill_data(const ov::Tensor& tensor) {
+    std::vector<T> actual;
+    const T* data = tensor.data<T>();
+    auto strides = tensor.get_strides();
+    for (auto&& c : ov::CoordinateTransformBasic{tensor.get_shape()}) {
+        size_t offset = 0;
+        for (size_t i = 0; i < strides.size(); i++)
+            offset += c[i] * strides[i];
+        actual.emplace_back(*(data + offset / tensor.get_element_type().size()));
+    }
+    return actual;
+};
+template <class T>
+void compare_data(const ov::Tensor& src, const ov::Tensor& dst) {
+    auto source_vec = fill_data<T>(src);
+    auto dest_vec = fill_data<T>(dst);
+
+    ASSERT_EQ(source_vec.size(), dest_vec.size());
+
+    for (size_t i = 0; i < source_vec.size(); i++) {
+        EXPECT_EQ(source_vec[i], dest_vec[i]);
+    }
+};
+
+template <ov::element::Type_t ET,
+          typename T = typename ov::element_type_traits<ET>::value_type,
+          typename std::enable_if<ET != ov::element::Type_t::string, bool>::type = true>
+void init_tensor(ov::Tensor& tensor, bool input) {
+    auto origPtr = tensor.data<T>();
+    ASSERT_NE(nullptr, origPtr);
+    for (size_t i = 0; i < tensor.get_size(); ++i) {
+        origPtr[i] = static_cast<T>(input ? i : -1);
+    }
+}
+
+template <ov::element::Type_t ET,
+          typename T = typename ov::element_type_traits<ET>::value_type,
+          typename std::enable_if<ET == ov::element::Type_t::string, bool>::type = true>
+void init_tensor(ov::Tensor& tensor, bool input) {
+    const auto origPtr = tensor.data<T>();
+    ASSERT_NE(nullptr, origPtr);
+    for (size_t i = 0; i < tensor.get_size(); ++i) {
+        origPtr[i] = std::to_string(i);
+    }
+}
+
+void init_tensor(ov::Tensor& tensor, bool input) {
+    switch (tensor.get_element_type()) {
+    case ov::element::bf16:
+        init_tensor<ov::element::bf16>(tensor, input);
+        break;
+    case ov::element::f16:
+        init_tensor<ov::element::f16>(tensor, input);
+        break;
+    case ov::element::f32:
+        init_tensor<ov::element::f32>(tensor, input);
+        break;
+    case ov::element::f64:
+        init_tensor<ov::element::f64>(tensor, input);
+        break;
+    case ov::element::i8:
+        init_tensor<ov::element::i8>(tensor, input);
+        break;
+    case ov::element::i16:
+        init_tensor<ov::element::i16>(tensor, input);
+        break;
+    case ov::element::i32:
+        init_tensor<ov::element::i32>(tensor, input);
+        break;
+    case ov::element::i64:
+        init_tensor<ov::element::i64>(tensor, input);
+        break;
+    case ov::element::u8:
+        init_tensor<ov::element::u8>(tensor, input);
+        break;
+    case ov::element::u16:
+        init_tensor<ov::element::u16>(tensor, input);
+        break;
+    case ov::element::u32:
+        init_tensor<ov::element::u32>(tensor, input);
+        break;
+    case ov::element::u64:
+        init_tensor<ov::element::u64>(tensor, input);
+        break;
+    case ov::element::string:
+        init_tensor<ov::element::string>(tensor, input);
+        break;
+    default:
+        OPENVINO_THROW("Unsupported data type");
+    }
+}
+
+void compare_tensors(const ov::Tensor& src, const ov::Tensor& dst) {
+    ASSERT_EQ(src.get_byte_size(), dst.get_byte_size());
+    ASSERT_EQ(src.get_size(), dst.get_size());
+    ASSERT_EQ(src.get_element_type(), dst.get_element_type());
+    switch (src.get_element_type()) {
+    case ov::element::bf16:
+        compare_data<ov::element_type_traits<ov::element::bf16>::value_type>(src, dst);
+        break;
+    case ov::element::f16:
+        compare_data<ov::element_type_traits<ov::element::f16>::value_type>(src, dst);
+        break;
+    case ov::element::f32:
+        compare_data<ov::element_type_traits<ov::element::f32>::value_type>(src, dst);
+        break;
+    case ov::element::f64:
+        compare_data<ov::element_type_traits<ov::element::f64>::value_type>(src, dst);
+        break;
+    case ov::element::i8:
+        compare_data<ov::element_type_traits<ov::element::i8>::value_type>(src, dst);
+        break;
+    case ov::element::i16:
+        compare_data<ov::element_type_traits<ov::element::i16>::value_type>(src, dst);
+        break;
+    case ov::element::i32:
+        compare_data<ov::element_type_traits<ov::element::i32>::value_type>(src, dst);
+        break;
+    case ov::element::i64:
+        compare_data<ov::element_type_traits<ov::element::i64>::value_type>(src, dst);
+        break;
+    case ov::element::u8:
+        compare_data<ov::element_type_traits<ov::element::u8>::value_type>(src, dst);
+        break;
+    case ov::element::u16:
+        compare_data<ov::element_type_traits<ov::element::u16>::value_type>(src, dst);
+        break;
+    case ov::element::u32:
+        compare_data<ov::element_type_traits<ov::element::u32>::value_type>(src, dst);
+        break;
+    case ov::element::u64:
+        compare_data<ov::element_type_traits<ov::element::u64>::value_type>(src, dst);
+        break;
+    case ov::element::string:
+        compare_data<ov::element_type_traits<ov::element::string>::value_type>(src, dst);
+        break;
+    default:
+        OPENVINO_THROW("Unsupported data type");
+    }
+}
+}  // namespace
+
+TEST_P(OVTensorTestCopy, copy_to) {
+    const auto& [type, p] = GetParam();
+    // Source tensors
+    ov::Tensor full_src_tensor;
+    ov::Tensor src_tensor;
+    if (!p.src_strides.empty()) {
+        full_src_tensor = ov::Tensor(type, ov::Shape{p.src_shape[0] * p.src_strides[0]});
+        src_tensor = ov::Tensor(type, p.src_shape, full_src_tensor.data(), p.src_strides);
+    } else {
+        src_tensor = full_src_tensor = ov::Tensor(type, p.src_shape);
+    }
+    init_tensor(full_src_tensor, true);
+
+    ov::Tensor full_dst_tensor;
+    ov::Tensor dst_tensor;
+    if (!p.dst_strides.empty()) {
+        full_dst_tensor = ov::Tensor(type, ov::Shape{p.dst_shape[0] * p.dst_strides[0]});
+        dst_tensor = ov::Tensor(type, p.dst_shape, full_dst_tensor.data(), p.dst_strides);
+    } else {
+        dst_tensor = full_dst_tensor = ov::Tensor(type, p.dst_shape);
+    }
+    init_tensor(full_src_tensor, false);
+
+    src_tensor.copy_to(dst_tensor);
+    compare_tensors(src_tensor, dst_tensor);
+}
+
+// clang-format off
+INSTANTIATE_TEST_SUITE_P(copy_tests,
+                         OVTensorTestCopy,
+                         ::testing::Combine(::testing::Values(
+                                                              ov::element::bf16,
+                                                              ov::element::f16,
+                                                              ov::element::f32,
+                                                              ov::element::f64,
+                                                              ov::element::i8,
+                                                              ov::element::i16,
+                                                              ov::element::i32,
+                                                              ov::element::i64,
+                                                              ov::element::u8,
+                                                              ov::element::u16,
+                                                              ov::element::u32,
+                                                              ov::element::u64
+                                            ),
+                                            ::testing::Values(
+                                                              TestParams {
+                                                                  ov::Shape{1, 3, 4, 8}, {},
+                                                                  {0}, {}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{3, 2, 2}, {},
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{128, 24, 8}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{64, 16, 8},
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{64, 16, 8},
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{128, 24, 8}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{}, {},
+                                                                  {}, {}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{1}, {},
+                                                                  {}, {}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{}, {},
+                                                                  {1}, {}
+                                                              },
+                                                              TestParams{
+                                                                  ov::Shape{3,2,2}, {},
+                                                                  ov::Shape{5}, {}
+                                                              },
+                                                              TestParams{
+                                                                  ov::Shape{3,2,2}, ov::Strides{64,16,8},
+                                                                  ov::Shape{5,2}, {}
+                                                              },
+                                                              TestParams{
+                                                                  ov::Shape{3,2,2}, ov::Strides{64,16,8},
+                                                                  ov::Shape{3,4,3}, ov::Strides{128,24,8}
+                                                              }
+                                           )));
+
+INSTANTIATE_TEST_SUITE_P(copy_tests_strings,
+                         OVTensorTestCopy,
+                         ::testing::Combine(::testing::Values(ov::element::string),
+                                            ::testing::Values(
+                                                              TestParams {
+                                                                  ov::Shape{1, 3, 4, 8}, {},
+                                                                  {0}, {}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{3, 2, 2}, {},
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{16 * string_size, 3 * string_size, string_size}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{8 * string_size, 2 * string_size, string_size},
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{8 * string_size, 2 * string_size, string_size},
+                                                                  ov::Shape{3, 2, 2}, ov::Strides{16 * string_size, 3 * string_size, string_size}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{}, {},
+                                                                  {}, {}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{1}, {},
+                                                                  {}, {}
+                                                              },
+                                                              TestParams {
+                                                                  ov::Shape{}, {},
+                                                                  {1}, {}
+                                                              }
+                                           )));
+// clang-format on
+
+TEST_F(OVTensorTest, sourceIdSetGet) {
+    float data[6] = {};
+    ov::Tensor tensor{ov::element::f32, ov::Shape{2, 3}, data};
+    EXPECT_EQ(ov::get_tensor_source_id(tensor), std::nullopt);
+    ov::set_tensor_source_id(tensor, 42u);
+    EXPECT_EQ(ov::get_tensor_source_id(tensor), std::optional<uint64_t>{42u});
+}
+
+TEST_F(OVTensorTest, sourceIdViewTensor) {
+    float data[6] = {};
+    ov::Tensor tensor{ov::element::f32, ov::Shape{2, 3}, data};
+    EXPECT_EQ(ov::get_tensor_source_id(tensor), std::nullopt);
+    ov::set_tensor_source_id(tensor, 99u);
+    EXPECT_EQ(ov::get_tensor_source_id(tensor), std::optional<uint64_t>{99u});
+}
+
+TEST_F(OVTensorTest, sourceIdRoiTensorHasNoSourceId) {
+    float data[16] = {};
+    ov::Tensor parent{ov::element::f32, ov::Shape{4, 4}, data};
+    ov::set_tensor_source_id(parent, 7u);
+    EXPECT_EQ(ov::get_tensor_source_id(parent), std::optional<uint64_t>{7u});
+
+    // ROI tensor does not expose source_id (only ViewTensor does)
+    ov::Tensor roi{parent, {1, 0}, {3, 4}};
+    EXPECT_EQ(ov::get_tensor_source_id(roi), std::nullopt);
+
+    // Setting source_id on ROI is a no-op — parent is unchanged
+    ov::set_tensor_source_id(roi, 11u);
+    EXPECT_EQ(ov::get_tensor_source_id(parent), std::optional<uint64_t>{7u});
+}
+
+TEST_F(OVTensorTest, sourceIdCopyToDoesNotCopyId) {
+    float src_data[6] = {}, dst_data[6] = {};
+    ov::Tensor src{ov::element::f32, ov::Shape{2, 3}, src_data};
+    ov::set_tensor_source_id(src, 42u);
+
+    ov::Tensor dst{ov::element::f32, ov::Shape{2, 3}, dst_data};
+    EXPECT_EQ(ov::get_tensor_source_id(dst), std::nullopt);
+
+    src.copy_to(dst);
+    EXPECT_EQ(ov::get_tensor_source_id(dst), std::nullopt);
+}
+
+TEST_F(OVTensorTest, sourceIdFreeHelpers) {
+    float data[6] = {};
+    ov::Tensor tensor{ov::element::f32, ov::Shape{2, 3}, data};
+    EXPECT_EQ(ov::get_tensor_source_id(tensor), std::nullopt);
+    ov::set_tensor_source_id(tensor, 55u);
+    EXPECT_EQ(ov::get_tensor_source_id(tensor), std::optional<uint64_t>{55u});
+}
+
+TEST_F(OVTensorTest, sourceIdMmapTensorHasNonZeroId) {
+    // Create a temporary file with some data
+    auto tmp_path = ov::test::utils::generateTestFilePrefix() + "_ov_source_id_test.bin";
+    {
+        std::ofstream f(tmp_path, std::ios::binary);
+        float data[6] = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
+        f.write(reinterpret_cast<const char*>(data), sizeof(data));
+    }
+
+    {
+        auto tensor = ov::read_tensor_data(tmp_path, ov::element::f32, ov::PartialShape{2, 3}, 0, true);
+        auto source_id = ov::get_tensor_source_id(tensor);
+        ASSERT_TRUE(source_id.has_value());
+        EXPECT_NE(source_id.value(), 0u);
+    }
+    std::filesystem::remove(tmp_path);
+}
+
+TEST_F(OVTensorTest, sourceIdIfstreamTensorHasNonZeroId) {
+    auto tmp_path = ov::test::utils::generateTestFilePrefix() + "_ov_source_id_ifstream_test.bin";
+    {
+        std::ofstream f(tmp_path, std::ios::binary);
+        float data[6] = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
+        f.write(reinterpret_cast<const char*>(data), sizeof(data));
+    }
+
+    {
+        auto tensor = ov::read_tensor_data(tmp_path, ov::element::f32, ov::PartialShape{2, 3}, 0, false);
+        auto source_id = ov::get_tensor_source_id(tensor);
+        ASSERT_TRUE(source_id.has_value());
+        EXPECT_NE(source_id.value(), 0u);
+    }
+    std::filesystem::remove(tmp_path);
+}
+
+TEST_F(OVTensorTest, sourceIdAllocatedTensorHasNoSourceId) {
+    // Allocated tensors (without external data pointer) are not ViewTensors
+    // and therefore do not have a source_id
+    ov::Tensor tensor{ov::element::f32, ov::Shape{2, 3}};
+    EXPECT_EQ(ov::get_tensor_source_id(tensor), std::nullopt);
+}
+
+namespace {
+class MockMappedMemory final : public ov::MappedMemory {
+public:
+    explicit MockMappedMemory(size_t size) : m_data(size) {}
+
+    const std::byte* data() const noexcept override {
+        return m_data.data();
+    }
+    std::byte* data() noexcept override {
+        return m_data.data();
+    }
+    size_t size() const noexcept override {
+        return m_data.size();
+    }
+    std::optional<uint64_t> get_id() const noexcept override {
+        return 7u;
+    }
+
+    MOCK_METHOD(void, hint_evict, (size_t offset, size_t size), (noexcept, override));
+    MOCK_METHOD(void, hint_prefetch, (size_t offset, size_t size), (noexcept, override));
+    MOCK_METHOD(ov::util::PrefetchToken, hint_prefetch_async, (size_t offset, size_t size), (noexcept, override));
+
+private:
+    std::vector<std::byte> m_data;
+};
+
+ov::Tensor make_buffer_tensor(const ov::element::Type& type,
+                              const ov::Shape& shape,
+                              std::shared_ptr<ov::util::IBuffer> buffer) {
+    const auto tensor_impl = ov::make_tensor(type, shape, std::move(buffer));
+    return ov::make_tensor(tensor_impl);
+}
+}  // namespace
+
+TEST_F(OVTensorTest, mappedMemoryPrefetchForwardsCompletionToken) {
+    const auto mapping = std::make_shared<MockMappedMemory>(64);
+    std::shared_ptr<ov::MappedMemory> memory = mapping;
+    std::shared_ptr<ov::util::IMemoryHints> hints = mapping;
+    std::promise<void> completion;
+    const auto expected = completion.get_future().share();
+
+    EXPECT_CALL(*mapping, hint_prefetch_async(0, ov::auto_size)).Times(2).WillRepeatedly(testing::Return(expected));
+    const auto memory_token = memory->hint_prefetch();
+    const auto hints_token = hints->hint_prefetch();
+    ASSERT_TRUE(memory_token.valid());
+    ASSERT_TRUE(hints_token.valid());
+
+    EXPECT_EQ(memory_token.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+    EXPECT_EQ(hints_token.wait_for(std::chrono::seconds(0)), std::future_status::timeout);
+    completion.set_value();
+    EXPECT_EQ(memory_token.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+    EXPECT_EQ(hints_token.wait_for(std::chrono::seconds(0)), std::future_status::ready);
+}
+
+TEST_F(OVTensorTest, bufferTensorViewsBufferAndTakesItsId) {
+    auto mapping = std::make_shared<MockMappedMemory>(64);
+    const auto tensor = make_buffer_tensor(ov::element::u8, ov::Shape{64}, mapping);
+    EXPECT_EQ(tensor.data(), static_cast<const void*>(mapping->data()));
+    EXPECT_EQ(ov::get_tensor_source_id(tensor), std::optional<uint64_t>{7u});
+
+    EXPECT_CALL(*mapping, hint_prefetch_async(0, ov::auto_size));
+    auto hints = ov::get_memory_hints(tensor);
+    EXPECT_EQ(hints.get(), static_cast<ov::util::IMemoryHints*>(mapping.get()));
+    hints->hint_prefetch();
+}
+
+TEST_F(OVTensorTest, bufferTensorCopyTo) {
+    auto mapping = std::make_shared<MockMappedMemory>(16);
+    std::iota(reinterpret_cast<uint8_t*>(mapping->data()), reinterpret_cast<uint8_t*>(mapping->data()) + 16, 0);
+    const auto tensor = make_buffer_tensor(ov::element::u8, ov::Shape{4, 4}, mapping);
+
+    ov::Tensor dst{ov::element::u8, ov::Shape{4, 4}};
+    tensor.copy_to(dst);
+    EXPECT_EQ(std::memcmp(dst.data(), mapping->data(), 16), 0);
+
+    ov::Tensor roi_dst{ov::element::u8, ov::Shape{2, 2}};
+    ov::Tensor{tensor, {1, 1}, {3, 3}}.copy_to(roi_dst);
+    EXPECT_THAT(std::vector<uint8_t>(roi_dst.data<uint8_t>(), roi_dst.data<uint8_t>() + 4),
+                testing::ElementsAre(5, 6, 9, 10));
+}
+
+TEST_F(OVTensorTest, memoryHintsCoverTensorRangeOfMapping) {
+    auto mapping = std::make_shared<MockMappedMemory>(1024);
+    const auto tensor = make_buffer_tensor(ov::element::u8, ov::Shape{1000}, mapping);
+    const ov::Tensor roi{tensor, {100}, {300}};
+
+    EXPECT_CALL(*mapping, hint_prefetch_async(0, 1000));
+    EXPECT_CALL(*mapping, hint_evict(0, 1000));
+    EXPECT_CALL(*mapping, hint_prefetch_async(100, 200));
+    EXPECT_CALL(*mapping, hint_evict(100, 200));
+
+    auto hints = ov::get_memory_hints(tensor);
+    ASSERT_NE(hints, nullptr);
+    hints->hint_prefetch();
+    hints->hint_evict();
+
+    auto roi_hints = ov::get_memory_hints(ov::Tensor{roi, {0}, {200}});
+    ASSERT_NE(roi_hints, nullptr);
+    roi_hints->hint_prefetch();
+    roi_hints->hint_evict();
+}
+
+TEST_F(OVTensorTest, memoryHintsNotAvailableWithoutBufferOrForStridedRoi) {
+    float data[16] = {};
+    ov::Tensor tensor{ov::element::f32, ov::Shape{4, 4}, data};
+    EXPECT_EQ(ov::get_memory_hints(tensor), nullptr);
+
+    const auto mapped = make_buffer_tensor(ov::element::f32, ov::Shape{4, 4}, std::make_shared<MockMappedMemory>(64));
+    EXPECT_EQ(ov::get_memory_hints(ov::Tensor{mapped, {0, 1}, {4, 3}}), nullptr);
+}
+
+TEST_F(OVTensorTest, bufferTensorRejectsMissingOrTooSmallBuffer) {
+    EXPECT_THROW(ov::make_tensor(ov::element::u8, ov::Shape{1}, std::shared_ptr<ov::util::IBuffer>{}), ov::Exception);
+    EXPECT_THROW(ov::make_tensor(ov::element::u8, ov::Shape{65}, std::make_shared<MockMappedMemory>(64)),
+                 ov::Exception);
+}
+
+TEST_F(OVTensorTest, memoryHintsAvailableForMmapTensor) {
+    auto tmp_path = ov::test::utils::generateTestFilePrefix() + "_ov_memory_hints_test.bin";
+    {
+        std::ofstream f(tmp_path, std::ios::binary);
+        float data[6] = {1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
+        f.write(reinterpret_cast<const char*>(data), sizeof(data));
+    }
+
+    {
+        auto tensor = ov::read_tensor_data(tmp_path, ov::element::f32, ov::PartialShape{2, 3}, 0, true);
+        auto hints = ov::get_memory_hints(tensor);
+        ASSERT_NE(hints, nullptr);
+        hints->hint_evict();
+        hints->hint_prefetch();
+        EXPECT_EQ(tensor.data<const float>()[5], 6.f);
+        EXPECT_EQ(
+            ov::get_memory_hints(ov::read_tensor_data(tmp_path, ov::element::f32, ov::PartialShape{2, 3}, 0, false)),
+            nullptr);
+    }
+    std::filesystem::remove(tmp_path);
+}
+
+}  // namespace ov::test

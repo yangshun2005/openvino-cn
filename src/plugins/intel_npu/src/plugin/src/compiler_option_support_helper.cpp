@@ -1,0 +1,67 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#include "compiler_option_support_helper.hpp"
+
+#include <algorithm>
+#include <memory>
+
+#include "intel_npu/common/option_support_cache.hpp"
+
+namespace intel_npu {
+
+namespace {
+OptionSupportCache::CacheKey toCacheKey(const ov::intel_npu::CompilerType compilerType) {
+    return static_cast<OptionSupportCache::CacheKey>(compilerType);
+}
+}  // namespace
+
+CompilerOptionSupportHelper::CompilerOptionSupportHelper(
+    const std::shared_ptr<const CompilerAdapterFactory>& adapterFactory)
+    : _adapterFactory(adapterFactory) {
+    OPENVINO_ASSERT(_adapterFactory != nullptr,
+                    "CompilerOptionSupportHelper requires a non-null CompilerAdapterFactory");
+    _optionSupportCache = _adapterFactory->getOptionSupportCache();
+}
+
+bool CompilerOptionSupportHelper::isOptionSupported(ov::intel_npu::CompilerType compilerType,
+                                                    const std::string& optionName,
+                                                    const std::optional<std::string>& optionValue) {
+    const auto& supportedCompilerTypes = _adapterFactory->getKnownCompilerTypes();
+    OPENVINO_ASSERT(std::find(supportedCompilerTypes.begin(), supportedCompilerTypes.end(), compilerType) !=
+                        supportedCompilerTypes.end(),
+                    "Unsupported compiler type");
+
+    const auto cacheKey = toCacheKey(compilerType);
+    const auto getCachedSupport = [&]() -> std::optional<bool> {
+        if (optionValue.has_value() || !_optionSupportCache) {
+            return std::nullopt;
+        }
+        return _optionSupportCache->isOptionSupported(cacheKey, optionName);
+    };
+
+    if (const auto cachedSupport = getCachedSupport(); cachedSupport.has_value()) {
+        return cachedSupport.value();
+    }
+
+    std::unique_ptr<ICompilerAdapter> compiler;
+    compiler = _adapterFactory->getCompiler(compilerType, "");
+
+    std::once_flag* optionsLoaded = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(_supportedOptionsLoadedMutex);
+        optionsLoaded = &_supportedOptionsLoaded[cacheKey];
+    }
+    std::call_once(*optionsLoaded, [&compiler]() {
+        compiler->get_supported_options();
+    });
+
+    if (const auto cachedSupport = getCachedSupport(); cachedSupport.has_value()) {
+        return cachedSupport.value();
+    }
+
+    return compiler->is_option_supported(optionName, optionValue);
+}
+
+}  // namespace intel_npu

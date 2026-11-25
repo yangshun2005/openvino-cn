@@ -1,0 +1,800 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#include "openvino/runtime/make_tensor.hpp"
+
+#include <memory>
+#include <mutex>
+#include <utility>
+
+#include "openvino/core/memory_util.hpp"
+#include "openvino/core/type/element_type_info.hpp"
+#include "openvino/runtime/iremote_tensor.hpp"
+#include "openvino/runtime/properties.hpp"
+#include "openvino/runtime/tensor.hpp"
+#include "openvino/util/mmap_object.hpp"
+#ifdef PROXY_PLUGIN_ENABLED
+#    include "openvino/proxy/plugin.hpp"
+#endif
+
+namespace ov {
+
+namespace {
+Shape make_roi_shape(const Shape& tensor_shape, const Coordinate& begin, const Coordinate& end) {
+    OPENVINO_ASSERT(tensor_shape.size() == begin.size());
+    OPENVINO_ASSERT(begin.size() == end.size());
+
+    auto roi_shape = Shape(begin.size());
+
+    auto roi_begin = begin.begin();
+    auto roi_end = end.begin();
+    auto roi_dim = roi_shape.begin();
+    auto max_dim = tensor_shape.begin();
+
+    for (; max_dim != tensor_shape.end(); ++max_dim, ++roi_begin, ++roi_end, ++roi_dim) {
+        OPENVINO_ASSERT(*roi_begin <= *max_dim);
+        OPENVINO_ASSERT(*roi_end <= *max_dim);
+        *roi_dim = *roi_end - *roi_begin;
+        OPENVINO_ASSERT(*roi_dim <= *max_dim);
+    }
+
+    return roi_shape;
+}
+
+// Extends strides to the rank of shape (which must be greater), which adds leading dimensions to the strides' shape.
+// Strides of a scalar are empty, so then the innermost added dimension is set to the element size.
+// The innermost stride of a sub-byte type is not a byte step, so a dimension added above it gets the packed row size.
+Strides extend_strides(const Strides& strides, const Shape& shape, const element::Type& element_type) {
+    auto dim = shape.size() - strides.size();
+    Strides extended;
+    extended.reserve(shape.size());
+    extended.resize(dim);
+    extended.insert(extended.end(), strides.begin(), strides.end());
+    if (strides.empty()) {
+        extended[--dim] = element_type.size();
+    } else if (strides.size() == 1 && element_type.bitwidth() < 8) {
+        extended[dim - 1] = util::get_dense_byte_strides(element_type, Shape{1, shape.back()}).front();
+        --dim;
+    }
+    while (dim-- > 0) {
+        extended[dim] = shape[dim + 1] * extended[dim + 1];
+    }
+    return extended;
+}
+
+// Computes the byte offset of a ROI inside its owner tensor.
+size_t compute_roi_offset(const std::shared_ptr<ITensor>& owner, const Coordinate& begin, const Coordinate& end) {
+    const auto& element_type = owner->get_element_type();
+    if (element_type.bitwidth() < 8) {
+        // sub-byte types: only the innermost dimension must be taken in full - every other dimension's
+        // byte stride is always whole, so it may be an arbitrary sub-range
+        const auto& shape = owner->get_shape();
+        const auto is_inner_dim_full = !shape.empty() && begin.back() == 0 && end.back() == shape.back();
+        OPENVINO_ASSERT(is_inner_dim_full, "ROI cannot slice the innermost dimension of a sub-byte tensor");
+    }
+
+    const auto& strides = owner->get_strides();
+    return std::inner_product(begin.begin(), begin.end(), strides.begin(), static_cast<size_t>(0));
+}
+}  // namespace
+
+// Hints for the [offset, offset + size) range of a file mapping.
+class MappedRangeHints final : public util::IMemoryHints {
+public:
+    MappedRangeHints(std::shared_ptr<MappedMemory> memory, size_t offset, size_t size)
+        : m_memory{std::move(memory)},
+          m_offset{offset},
+          m_size{size} {}
+
+    void hint_evict() noexcept override {
+        m_memory->hint_evict(m_offset, m_size);
+    }
+
+    util::PrefetchToken hint_prefetch() noexcept override {
+        return m_memory->hint_prefetch_async(m_offset, m_size);
+    }
+
+private:
+    std::shared_ptr<MappedMemory> m_memory;
+    size_t m_offset;
+    size_t m_size;
+};
+
+/**
+ * @brief View tensor to external memory
+ * The tensor doesn't own the external memory
+ */
+class ViewTensor : public ITensor {
+public:
+    ViewTensor(const element::Type element_type, const Shape& shape, void* ptr)
+        : m_element_type{element_type},
+          m_shape{shape},
+          m_capacity{shape},
+          m_strides{},
+          m_strides_once{},
+          m_ptr{ptr} {
+        OPENVINO_ASSERT(shape_size(shape) == 0 || m_ptr != nullptr);
+        OPENVINO_ASSERT(m_element_type.is_static());
+    }
+
+    void* data() override {
+        return m_ptr;
+    }
+
+    void* data(const element::Type& element_type) override {
+        OPENVINO_ASSERT(is_pointer_representable(element_type),
+                        "Tensor data with element type ",
+                        get_element_type(),
+                        ", is not representable as pointer to ",
+                        element_type);
+        return m_ptr;
+    }
+
+    const void* data() const override {
+        return m_ptr;
+    }
+
+    const void* data(const element::Type& element_type) const override {
+        OPENVINO_ASSERT(is_pointer_representable(element_type),
+                        "Tensor data with element type ",
+                        get_element_type(),
+                        ", is not representable as pointer to ",
+                        element_type);
+        return m_ptr;
+    }
+
+    void* data_rw() override {
+        return m_ptr;
+    }
+
+    void* data_rw(const element::Type& element_type) override {
+        OPENVINO_ASSERT(is_pointer_representable(element_type),
+                        "Tensor data with element type ",
+                        get_element_type(),
+                        ", is not representable as pointer to ",
+                        element_type);
+        return m_ptr;
+    }
+
+    const element::Type& get_element_type() const override {
+        return m_element_type;
+    }
+
+    const Shape& get_shape() const override {
+        return m_shape;
+    }
+
+    void set_shape(ov::Shape new_shape) override {
+        OPENVINO_ASSERT(shape_size(new_shape) <= ov::shape_size(m_capacity), "Could set new shape: ", new_shape);
+        m_shape = std::move(new_shape);
+        m_strides.clear();
+        update_strides();
+    }
+
+    const Strides& get_strides() const override {
+        const auto can_compute_byte_strides = util::can_compute_byte_strides(m_element_type, m_shape);
+        OPENVINO_ASSERT(can_compute_byte_strides,
+                        "Could not get strides for tensor type: ",
+                        m_element_type,
+                        ", shape: ",
+                        m_shape,
+                        " - byte strides are only representable when the element bitwidth evenly divides a byte "
+                        "and the last dimension is byte-aligned");
+        std::call_once(m_strides_once, &ViewTensor::update_strides, this);
+        return m_strides;
+    }
+
+    std::optional<uint64_t> get_source_id() const {
+        return m_source_id;
+    }
+
+    void set_source_id(uint64_t id) {
+        m_source_id = id;
+    }
+
+protected:
+    bool is_pointer_representable(const element::Type& element_type) const {
+        if (element_type.is_dynamic()) {
+            return true;
+        } else {
+            // gets type info to reduce validation to access speed, due to performance issues
+            const auto& other_type_info = element::get_type_info(element_type);
+            const auto& this_type_info = element::get_type_info(get_element_type());
+            return (get_element_type() != element::string && element_type != element::string &&
+                    other_type_info.m_bitwidth == this_type_info.m_bitwidth &&
+                    other_type_info.m_is_real == this_type_info.m_is_real) ||
+                   (element_type == element::string && element::string == get_element_type());
+        }
+    }
+
+    void update_strides() const {
+        if (m_strides.empty() && util::can_compute_byte_strides(m_element_type, get_shape())) {
+            m_strides = util::get_dense_byte_strides(m_element_type, get_shape());
+        }
+    }
+
+    element::Type m_element_type;
+    Shape m_shape;
+    Shape m_capacity;
+    mutable Strides m_strides;
+    mutable std::once_flag m_strides_once;
+    void* m_ptr;
+    std::optional<uint64_t> m_source_id;
+};
+
+/**
+ * @brief Read-only view tensor to external memory
+ * The tensor doesn't own the external memory
+ */
+class ReadOnlyViewTensor : public ViewTensor {
+public:
+    ReadOnlyViewTensor(const element::Type element_type, const Shape& shape, const void* ptr)
+        : ViewTensor{element_type, shape, const_cast<void*>(ptr)} {}
+
+    using ViewTensor::data;
+
+    [[noreturn]] void* data_rw() override {
+        OPENVINO_THROW("Can not access non-const pointer use e.g. 'static_cast<const ov::Tensor&>.data()'");
+    }
+
+    [[noreturn]] void* data_rw(const element::Type& element_type) override {
+        OPENVINO_THROW("Can not access non-const pointer use e.g. 'static_cast<const ov::Tensor&>.data(element_type)'");
+    }
+};
+
+/**
+ * @brief Read-only view tensor on the beginning of a buffer which it keeps alive
+ */
+class BufferReadOnlyViewTensor : public ReadOnlyViewTensor {
+public:
+    BufferReadOnlyViewTensor(const element::Type element_type,
+                             const Shape& shape,
+                             std::shared_ptr<util::IBuffer> buffer)
+        : ReadOnlyViewTensor{element_type, shape, buffer->data()},
+          m_buffer{std::move(buffer)} {
+        OPENVINO_ASSERT(get_byte_size() <= m_buffer->size(), "Tensor does not fit into the buffer");
+        m_source_id = m_buffer->get_id();
+    }
+
+    const std::shared_ptr<util::IBuffer>& get_buffer() const {
+        return m_buffer;
+    }
+
+private:
+    std::shared_ptr<util::IBuffer> m_buffer;
+};
+
+std::shared_ptr<ITensor> make_tensor(const element::Type type,
+                                     const Shape& shape,
+                                     std::shared_ptr<util::IBuffer> buffer) {
+    OPENVINO_ASSERT(buffer, "Buffer is not set");
+    return std::make_shared<BufferReadOnlyViewTensor>(type, shape, std::move(buffer));
+}
+
+/**
+ * @brief View tensor on external memory with strides
+ */
+class StridedViewTensor : public ViewTensor {
+public:
+    StridedViewTensor(const element::Type element_type, const Shape& shape, void* ptr, const Strides& strides)
+        : ViewTensor{element_type, shape, ptr} {
+        const auto can_compute_byte_strides = util::can_compute_byte_strides(get_element_type(), shape);
+        OPENVINO_ASSERT(can_compute_byte_strides,
+                        "Could not create strided access tensor for tensor type: ",
+                        get_element_type(),
+                        ", shape: ",
+                        shape,
+                        " - byte strides are only representable when the element bitwidth evenly divides a byte "
+                        "and the last dimension is byte-aligned");
+        // Save default strides
+        auto shape_strides = get_strides();
+        // Change strides
+        m_strides = strides;
+        OPENVINO_ASSERT(m_shape.size() == m_strides.size());
+
+        const auto is_sub_byte = get_element_type().bitwidth() < 8;
+        const auto has_dense_inner_stride = !is_sub_byte || m_strides.back() == shape_strides.back();
+        OPENVINO_ASSERT(has_dense_inner_stride,
+                        "Sub-byte tensor must keep the default innermost byte stride, got: ",
+                        m_strides);
+        for (size_t i = 0; i < m_strides.size(); ++i) {
+            OPENVINO_ASSERT(shape_strides[i] <= m_strides[i],
+                            "shape stride: ",
+                            shape_strides[i],
+                            ", stride: ",
+                            m_strides[i]);
+            OPENVINO_ASSERT((m_strides[i] % get_element_type().size()) == 0,
+                            "shape stride: ",
+                            shape_strides[i],
+                            ", stride: ",
+                            m_strides[i]);
+        }
+
+        // for sub-byte types the last dimension's stride is not addressable placeholder (already validated above),
+        // so it is excluded from the overlap check between neighboring dimensions
+        const auto overlap_check_end = is_sub_byte ? m_strides.size() - 1 : m_strides.size();
+        for (size_t i = 1; i < overlap_check_end; ++i) {
+            OPENVINO_ASSERT(m_strides[i - 1] >= m_strides[i] * shape[i],
+                            "Strides: ",
+                            m_strides,
+                            " are incompatible with shapes: ",
+                            m_shape);
+        }
+    }
+
+    void set_shape(ov::Shape new_shape) override {
+        OPENVINO_ASSERT(m_capacity.size() == new_shape.size(),
+                        "Cannot set new shape: ",
+                        new_shape,
+                        " for tensor with strides! Shapes are not compatible.");
+        for (size_t i = 0; i < new_shape.size(); i++) {
+            OPENVINO_ASSERT(m_capacity[i] >= new_shape[i],
+                            "Cannot set new shape: ",
+                            new_shape,
+                            " for tensor with strides! Dimension: ",
+                            i,
+                            " is not compatible.");
+        }
+        const auto can_compute_byte_strides = util::can_compute_byte_strides(get_element_type(), new_shape);
+        OPENVINO_ASSERT(can_compute_byte_strides, "Byte strides are not representable for shape: ", new_shape);
+        m_shape = std::move(new_shape);
+    }
+};
+
+class ReadOnlyStridedViewTensor : public StridedViewTensor {
+public:
+    ReadOnlyStridedViewTensor(const element::Type element_type,
+                              const Shape& shape,
+                              const void* ptr,
+                              const Strides& strides)
+        : StridedViewTensor{element_type, shape, const_cast<void*>(ptr), strides} {}
+
+    using StridedViewTensor::data;
+
+    [[noreturn]] void* data_rw() override {
+        OPENVINO_THROW("Can not access non-const pointer use e.g. 'static_cast<const ov::Tensor&>.data()'");
+    }
+
+    [[noreturn]] void* data_rw(const element::Type& element_type) override {
+        OPENVINO_THROW("Can not access non-const pointer use e.g. 'static_cast<const ov::Tensor&>.data()'");
+    }
+};
+
+/**
+ * @brief Creates view tensor on external memory
+ *
+ * @param element_type Tensor element type
+ * @param shape Tensor shape
+ * @param ptr pointer to external memory
+ * @param byte_strides Tensor strides
+ *
+ * @return Shared pointer to tensor interface
+ */
+std::shared_ptr<ITensor> make_tensor(const element::Type element_type,
+                                     const Shape& shape,
+                                     void* ptr,
+                                     const Strides& byte_strides) {
+    return byte_strides.empty() ? std::make_shared<ViewTensor>(element_type, shape, ptr)
+                                : std::make_shared<StridedViewTensor>(element_type, shape, ptr, byte_strides);
+}
+
+/**
+ * @brief Creates read-only view tensor on external memory
+ *
+ * @param element_type Tensor element type
+ * @param shape Tensor shape
+ * @param ptr pointer to external memory
+ * @param byte_strides Tensor strides
+ *
+ * @return Shared pointer to tensor interface
+ */
+std::shared_ptr<ITensor> make_tensor(const element::Type element_type,
+                                     const Shape& shape,
+                                     const void* ptr,
+                                     const Strides& byte_strides) {
+    if (byte_strides.empty()) {
+        return std::make_shared<ReadOnlyViewTensor>(element_type, shape, ptr);
+    } else {
+        return std::make_shared<ReadOnlyStridedViewTensor>(element_type, shape, ptr, byte_strides);
+    }
+}
+
+/**
+ * @brief Tensor with allocated memory
+ * Tensor owns the memory
+ */
+class AllocatedTensor : public ViewTensor {
+    using MemSpace = std::pair<void*, size_t>;
+
+    static MemSpace do_allocate(const element::Type& element_type, const Shape& shape, const Allocator& allocator) {
+        OPENVINO_ASSERT(allocator, "Allocator was not initialized");
+        const auto byte_size = util::get_memory_size_safe(element_type, shape);
+        OPENVINO_ASSERT(byte_size, bad_alloc_error_msg(element_type, shape));
+        auto data = const_cast<Allocator&>(allocator).allocate(*byte_size);
+        OPENVINO_ASSERT(*byte_size == 0 || data != nullptr, "Failed to allocate memory");
+        initialize_elements(data, element_type, shape);
+        return {data, *byte_size};
+    }
+
+    AllocatedTensor(const element::Type element_type, const Shape& shape, const Allocator& allocator, MemSpace alloc)
+        : ViewTensor{element_type, shape, alloc.first},
+          m_allocator{allocator},
+          m_bytes_capacity{alloc.second} {}
+
+public:
+    AllocatedTensor(const element::Type element_type, const Shape& shape, const Allocator& allocator)
+        : AllocatedTensor{element_type, shape, allocator, do_allocate(element_type, shape, allocator)} {}
+
+    ~AllocatedTensor() {
+        destroy_memory();
+    }
+
+    void set_shape(ov::Shape new_shape) override {
+        if (m_shape == new_shape)
+            return;
+
+        const auto byte_size = util::get_memory_size_safe(m_element_type, new_shape);
+        OPENVINO_ASSERT(byte_size, bad_alloc_error_msg(m_element_type, new_shape));
+        m_shape = std::move(new_shape);
+
+        if (*byte_size > get_bytes_capacity()) {
+            destroy_memory();
+            // allocate buffer and initialize objects from scratch
+            m_capacity = m_shape;
+            m_ptr = m_allocator.allocate(*byte_size);
+            m_bytes_capacity = *byte_size;
+            initialize_elements(m_ptr, m_element_type, m_shape);
+        }
+
+        m_strides.clear();
+        update_strides();
+    }
+
+private:
+    void destroy_elements(size_t begin_ind, size_t end_ind) {
+        // it removes elements from tail
+        if (m_ptr != nullptr && get_element_type() == element::string) {
+            auto strings = static_cast<std::string*>(m_ptr);
+            for (size_t ind = begin_ind; ind < end_ind; ++ind) {
+                using std::string;
+                strings[ind].~string();
+            }
+        }
+    }
+
+    void destroy_memory() {
+        destroy_elements(0, get_capacity());
+        m_allocator.deallocate(m_ptr, get_bytes_capacity());
+        m_ptr = nullptr;
+    }
+
+    static void initialize_elements(void* data, const element::Type& element_type, const Shape& shape) {
+        if (element_type == element::Type_t::string) {
+            auto num_elements = shape_size(shape);
+            auto string_ptr = static_cast<std::string*>(data);
+            std::uninitialized_fill_n(string_ptr, num_elements, std::string());
+        }
+    }
+
+    size_t get_capacity() const {
+        return shape_size(m_capacity);
+    }
+
+    size_t get_bytes_capacity() const {
+        return m_bytes_capacity;
+    }
+
+    static std::string bad_alloc_error_msg(const element::Type& element_type, const Shape& shape) {
+        return "Cannot allocate memory for type: " + element_type.to_string() + " and shape: " + shape.to_string();
+    }
+
+    Allocator m_allocator;
+    size_t m_bytes_capacity;
+};
+
+/**
+ * @brief Creates allocated tensor
+ *
+ * @param element_type Tensor element type
+ * @param shape Tensor shape
+ * @param allocator Tensor allocator
+ *
+ * @return Shared pointer to tensor interface
+ */
+std::shared_ptr<ITensor> make_tensor(const element::Type element_type, const Shape& shape, const Allocator& allocator) {
+    return std::make_shared<AllocatedTensor>(element_type, shape, allocator);
+}
+
+/**
+ * @brief Base class for representing a Region of Interest (ROI) on another tensor
+ * ROI tensor holds the owner
+ */
+class BaseRoiTensor {
+public:
+    BaseRoiTensor(const std::shared_ptr<ITensor>& owner, const Coordinate& begin, const Coordinate& end)
+        : m_owner{owner},
+          m_shape{make_roi_shape(owner->get_shape(), begin, end)},
+          m_capacity{m_shape},
+          m_offset{compute_roi_offset(owner, begin, end)} {}
+
+    void set_shape(ov::Shape new_shape) {
+        OPENVINO_ASSERT(new_shape.size() >= m_shape.size());
+        const auto last_new_dim = new_shape.crend();
+        auto new_dim = new_shape.crbegin();
+        for (auto max_dim = m_capacity.crbegin(); new_dim != last_new_dim && max_dim != m_capacity.crend();
+             ++max_dim, ++new_dim) {
+            OPENVINO_ASSERT(*new_dim <= *max_dim,
+                            "Cannot set new shape: ",
+                            new_shape,
+                            " for ROI tensor! New dimension at index: ",
+                            std::distance(new_shape.cbegin(), new_dim.base()) - 1,
+                            " is not compatible.");
+        }
+        new_dim = std::find_if(new_dim, last_new_dim, [](auto&& dim) {
+            return dim != 1;
+        });
+        OPENVINO_ASSERT(
+            new_dim == last_new_dim,
+            "Cannot set new shape: ",
+            new_shape,
+            " for ROI tensor! The expanding rank dimension(s) of ROI must be ones, but it is not at index: ",
+            std::distance(new_shape.cbegin(), new_dim.base()) - 1);
+        const auto can_compute_byte_strides = util::can_compute_byte_strides(m_owner->get_element_type(), new_shape);
+        OPENVINO_ASSERT(can_compute_byte_strides, "Byte strides are not representable for shape: ", new_shape);
+
+        m_shape = std::move(new_shape);
+        update_strides();
+    }
+
+    size_t get_offset() const {
+        return m_offset;
+    }
+
+    const std::shared_ptr<ITensor>& get_owner() const {
+        return m_owner;
+    }
+
+protected:
+    const Strides& get_roi_strides() const {
+        return m_strides.empty() ? m_owner->get_strides() : m_strides;
+    }
+
+    std::shared_ptr<ITensor> m_owner;
+    Shape m_shape;
+    const Shape m_capacity;
+    const size_t m_offset;
+
+private:
+    void update_strides() {
+        const auto& owner_strides = m_owner->get_strides();
+        if (m_shape.size() > owner_strides.size()) {
+            m_strides = extend_strides(owner_strides, m_shape, m_owner->get_element_type());
+        } else {
+            m_strides.clear();
+        }
+    }
+
+    Strides m_strides;
+};
+
+/**
+ * @brief Tensor representing a Region of Interest (ROI) on another host tensor
+ * ROI tensor holds the owner
+ */
+class RoiTensor : public BaseRoiTensor, public ITensor {
+public:
+    RoiTensor(const std::shared_ptr<ITensor>& owner, const Coordinate& begin, const Coordinate& end)
+        : BaseRoiTensor(owner, begin, end) {}
+
+    const element::Type& get_element_type() const override {
+        return m_owner->get_element_type();
+    }
+
+    const Strides& get_strides() const override {
+        return get_roi_strides();
+    }
+
+    const Shape& get_shape() const override {
+        return m_shape;
+    }
+
+    void set_shape(ov::Shape new_shape) override {
+        BaseRoiTensor::set_shape(new_shape);
+    }
+
+    void* data() override {
+        return static_cast<uint8_t*>(m_owner->data()) + m_offset;
+    }
+
+    void* data(const element::Type& element_type) override {
+        return static_cast<uint8_t*>(m_owner->data()) + m_offset;
+    }
+
+    const void* data() const override {
+        return static_cast<uint8_t*>(m_owner->data()) + m_offset;
+    }
+
+    const void* data(const element::Type& element_type) const override {
+        return static_cast<uint8_t*>(m_owner->data()) + m_offset;
+    }
+
+    void* data_rw() override {
+        return static_cast<uint8_t*>(m_owner->data_rw()) + m_offset;
+    }
+
+    void* data_rw(const element::Type& element_type) override {
+        return static_cast<uint8_t*>(m_owner->data_rw(element_type)) + m_offset;
+    }
+};
+
+/**
+ * @brief Tensor representing a Region of Interest (ROI) on another device tensor
+ * ROI tensor holds the owner
+ */
+class RoiRemoteTensor : public BaseRoiTensor, public IRemoteTensor {
+public:
+    RoiRemoteTensor(const std::shared_ptr<ITensor>& owner, const Coordinate& begin, const Coordinate& end)
+        : BaseRoiTensor(owner, begin, end) {}
+
+    const element::Type& get_element_type() const override {
+        return m_owner->get_element_type();
+    }
+
+    const Strides& get_strides() const override {
+        return get_roi_strides();
+    }
+
+    const Shape& get_shape() const override {
+        return m_shape;
+    }
+
+    void set_shape(ov::Shape new_shape) override {
+        BaseRoiTensor::set_shape(new_shape);
+    }
+
+    void copy_to(const std::shared_ptr<ov::ITensor>& dst) const override {
+        auto owner_remote_tensor = std::dynamic_pointer_cast<ov::IRemoteTensor>(m_owner);
+
+        if (std::dynamic_pointer_cast<RoiRemoteTensor>(dst)) {
+            OPENVINO_ASSERT(get_shape() == dst->get_shape(),
+                            "Cannot copy to RoiRemoteTensor. Shapes are not equal. (src: ",
+                            get_shape(),
+                            " != dst: ",
+                            dst->get_shape(),
+                            ")");
+
+            auto dst_roi_remote_tensor = std::dynamic_pointer_cast<RoiRemoteTensor>(dst);
+            owner_remote_tensor->copy_to(dst_roi_remote_tensor->m_owner,
+                                         m_offset,
+                                         dst_roi_remote_tensor->m_offset,
+                                         m_shape);
+        } else {
+            owner_remote_tensor->copy_to(dst, m_offset, 0, m_shape);
+        }
+    };
+
+    void copy_from(const std::shared_ptr<const ov::ITensor>& src) override {
+        auto owner_remote_tensor = std::dynamic_pointer_cast<ov::IRemoteTensor>(m_owner);
+
+        OPENVINO_ASSERT(src->get_shape() == get_shape(),
+                        "Cannot copy to RoiRemoteTensor. Shapes are not equal. (src: ",
+                        src->get_shape(),
+                        " != dst: ",
+                        get_shape(),
+                        ")");
+
+        if (std::dynamic_pointer_cast<const RoiRemoteTensor>(src)) {
+            const auto src_roi_remote_tensor = std::dynamic_pointer_cast<const RoiRemoteTensor>(src);
+            owner_remote_tensor->copy_from(src_roi_remote_tensor->m_owner,
+                                           src_roi_remote_tensor->m_offset,
+                                           m_offset,
+                                           m_shape);
+        } else {
+            owner_remote_tensor->copy_from(src, 0, m_offset, m_shape);
+        }
+    };
+
+    const AnyMap& get_properties() const override {
+        auto remote_tensor = std::dynamic_pointer_cast<ov::IRemoteTensor>(m_owner);
+        return remote_tensor->get_properties();
+    };
+
+    const std::string& get_device_name() const override {
+        auto remote_tensor = std::dynamic_pointer_cast<ov::IRemoteTensor>(m_owner);
+        return remote_tensor->get_device_name();
+    }
+};
+
+/**
+ * @brief Creates ROI tensor
+ * It determines whether the tensor is remote tensor or regular tensor and returns the appropriate ROI tensor type
+ *
+ * @param other Tensor what owns the memory
+ * @param begin Begin coordinates
+ * @param end End coordinates
+ *
+ * @return Shared pointer to tensor interface
+ */
+std::shared_ptr<ITensor> make_tensor(const std::shared_ptr<ITensor>& other,
+                                     const Coordinate& begin,
+                                     const Coordinate& end) {
+    if (std::dynamic_pointer_cast<IRemoteTensor>(other)) {
+        return std::make_shared<RoiRemoteTensor>(other, begin, end);
+    } else {
+        return std::make_shared<RoiTensor>(other, begin, end);
+    }
+}
+
+namespace util {
+
+ov::Tensor make_tensor(const std::shared_ptr<ITensor>& tensor, const std::shared_ptr<void>& so) {
+    return ov::Tensor(tensor, so);
+}
+
+void get_tensor_impl(const ov::Tensor& tensor, std::shared_ptr<ITensor>& tensor_impl, std::shared_ptr<void>& so) {
+    tensor_impl = tensor._impl;
+    so = tensor._so;
+}
+
+}  // namespace util
+
+ov::Tensor make_tensor(const ov::SoPtr<ITensor>& tensor) {
+    return util::make_tensor(tensor._ptr, tensor._so);
+}
+
+ov::SoPtr<ov::ITensor> get_tensor_impl(const ov::Tensor& tensor) {
+    std::shared_ptr<ov::ITensor> tensor_impl;
+    std::shared_ptr<void> so;
+    util::get_tensor_impl(tensor, tensor_impl, so);
+    return ov::SoPtr<ov::ITensor>(tensor_impl, so);
+}
+
+size_t get_tensor_data_offset(const ov::ITensor& tensor) {
+    if (auto tensor_impl = dynamic_cast<const BaseRoiTensor*>(&tensor)) {
+        return tensor_impl->get_offset();
+    }
+    return 0;
+}
+
+std::optional<uint64_t> get_tensor_source_id(const ov::Tensor& tensor) {
+    if (auto itensor = std::dynamic_pointer_cast<ViewTensor>(get_tensor_impl(tensor)._ptr)) {
+        return itensor->get_source_id();
+    }
+    return std::nullopt;
+}
+
+void set_tensor_source_id(ov::Tensor& tensor, uint64_t id) {
+    if (auto itensor = std::dynamic_pointer_cast<ViewTensor>(get_tensor_impl(tensor)._ptr)) {
+        itensor->set_source_id(id);
+    }
+}
+
+namespace {
+std::shared_ptr<BufferReadOnlyViewTensor> get_buffer_owner(const std::shared_ptr<ITensor>& itensor) {
+    if (auto roi = std::dynamic_pointer_cast<BaseRoiTensor>(itensor)) {
+        return get_buffer_owner(roi->get_owner());
+    }
+    return std::dynamic_pointer_cast<BufferReadOnlyViewTensor>(itensor);
+}
+}  // namespace
+
+std::shared_ptr<util::IMemoryHints> get_memory_hints(const ov::Tensor& tensor) {
+    const auto owner = get_buffer_owner(get_tensor_impl(tensor)._ptr);
+    if (!owner || !tensor.is_continuous()) {
+        return nullptr;
+    }
+    const auto& buffer = owner->get_buffer();
+    const auto offset = static_cast<size_t>(static_cast<const std::byte*>(tensor.data()) - buffer->data());
+    const auto size = tensor.get_byte_size();
+    if (offset == 0 && size == buffer->size()) {
+        return buffer;
+    }
+    // shortcut: only file mappings give hints for a sub-range, add ranged hints to IMemoryHints if others need it.
+    if (auto mapping = std::dynamic_pointer_cast<MappedMemory>(buffer)) {
+        return std::make_shared<MappedRangeHints>(std::move(mapping), offset, size);
+    }
+    return nullptr;
+}
+
+}  // namespace ov

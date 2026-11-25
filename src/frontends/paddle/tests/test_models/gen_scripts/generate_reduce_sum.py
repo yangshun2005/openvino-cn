@@ -1,0 +1,58 @@
+# Copyright (C) 2018-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+#
+# reduce_sum paddle model generator
+#
+
+import numpy as np
+import sys
+from save_model import saveModel
+
+
+def reduce_sum(name : str, x, axis=None, keepdim=False, dtype=None):
+    import paddle
+    paddle.enable_static()
+
+    with paddle.static.program_guard(paddle.static.Program(), paddle.static.Program()):
+        data_x = paddle.static.data(name='x', shape=x.shape, dtype=x.dtype)
+        out = paddle.sum(data_x, axis=axis, keepdim=keepdim, dtype=dtype)
+
+        cpu = paddle.static.cpu_places(1)
+        exe = paddle.static.Executor(cpu[0])
+
+        # startup program will call initializer to initialize the parameters.
+        exe.run(paddle.static.default_startup_program())
+        outs = exe.run(
+        feed={'x': x},
+        fetch_list=[out])
+        saveModel(name, exe, feed_vars=[data_x], fetchlist=[out], inputs=[x], outputs=[outs[0]], target_dir=sys.argv[1])
+
+    return outs[0]
+
+
+def main():
+    data = np.array([[[1.0,2.0], [3.0, 4.0]], [[5.0,6.0], [7.0, 8.0]]]).astype(np.float32)
+
+    reduce_sum("reduce_sum_test_0", data)
+    reduce_sum("reduce_sum_test_1", data, axis=0, keepdim=False)
+    reduce_sum("reduce_sum_test_2", data, axis=-1, keepdim=False)
+    reduce_sum("reduce_sum_test_3", data, axis=1, keepdim=True)
+    reduce_sum("reduce_sum_test_4", data, axis=[1,2], keepdim=False)
+    reduce_sum("reduce_sum_test_5", data, axis=[0,1], keepdim=True)
+
+    # issue 37952: an unset dtype promotes int32 to int64, an explicit one is used verbatim
+    data_i32 = np.array([[1, 2, 3], [4, 5, 6]]).astype(np.int32)
+    reduce_sum("reduce_sum_i32", data_i32, axis=1, keepdim=True)
+    reduce_sum("reduce_sum_i32_dtype_i32", data_i32, axis=1, keepdim=True, dtype="int32")
+    # issue 37952: fractional inputs, so cast-before-accumulate (3, 6) differs from cast-after (5, 8)
+    data2 = np.array([[1.9, 1.9, 1.9], [2.9, 2.9, 2.9]]).astype(np.float32)
+    reduce_sum("reduce_sum_dtype_i64", data2, axis=1, keepdim=True, dtype="int64")
+    # issue 37952: boolean input must convert (Paddle promotes it to int64 by default)
+    b = np.array([[True, False, True], [False, True, True]])
+    reduce_sum("reduce_sum_bool_in", b, axis=1, keepdim=False)
+    reduce_sum("reduce_sum_bool_dtype_i64", b, axis=1, keepdim=False, dtype="int64")
+
+
+if __name__ == "__main__":
+    main()

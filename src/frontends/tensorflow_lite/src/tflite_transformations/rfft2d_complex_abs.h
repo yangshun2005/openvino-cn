@@ -1,0 +1,27 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+#include <memory>
+#include <utility>
+
+#include "openvino/pass/graph_rewrite.hpp"
+#include "openvino/pass/pass.hpp"
+
+namespace ov::frontend::tensorflow_lite::pass {
+
+// This transformation replaces a pattern containing complex numbers with simpler one:
+// Original pattern:
+//  Rfft2d->Reshape->ComplexAbs
+//
+// Replaced with:
+//  RDFT -> Split -(real)-> Unsqueeze -> Reshape -> Square -> Add -> Sqrt
+//               \-(imag)-> Unsqueeze -> Reshape -> Square /
+class Rfft2dSimplifier : public ov::pass::MatcherPass {
+public:
+    OPENVINO_MATCHER_PASS_RTTI("ov::frontend::tensorflow_lite::pass::Rfft2dSimplifier");
+    Rfft2dSimplifier();
+};
+
+}  // namespace ov::frontend::tensorflow_lite::pass

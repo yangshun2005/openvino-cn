@@ -1,0 +1,87 @@
+# Copyright (C) 2018-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+
+if (NOT ENABLE_HETERO)
+    return()
+endif()
+
+set(TARGET_NAME openvino_hetero_plugin)
+
+set(SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/async_infer_request.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/blob_serialization.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/compiled_model.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/graph_debug_dump.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hsm_reader_handler.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hsm_writer_handler.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/op/device_subgraph.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/remote_context.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/remote_tensor.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/subgraph_collector.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sync_infer_request.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/version.cpp)
+
+set(HEADERS
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/async_infer_request.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/blob_serialization.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/compiled_model.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/config.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/graph_debug_dump.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hsm_common.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hsm_reader_handler.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/hsm_writer_handler.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/itt.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/op/device_subgraph.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/perf_log.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/plugin.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/properties.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/remote_context.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/remote_tensor.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/subgraph_collector.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/sync_infer_request.hpp)
+
+ov_add_plugin(NAME ${TARGET_NAME}
+              DEVICE_NAME "HETERO"
+              PSEUDO_DEVICE
+              SOURCES ${SOURCES} ${HEADERS}
+              VERSION_DEFINES_FOR src/version.cpp
+              ADD_CLANG_FORMAT)
+
+ov_build_target_faster(${TARGET_NAME}
+    UNITY
+)
+
+target_link_libraries(${TARGET_NAME} PRIVATE openvino::pugixml)
+
+# must be called after all target_link_libraries
+ov_add_api_validator_post_build_step(TARGET ${TARGET_NAME})
+
+set_target_properties(${TARGET_NAME} PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE ${ENABLE_LTO})
+
+if(ENABLE_TESTS)
+    if(BUILD_SHARED_LIBS)
+        set(OBJ_NAME ${TARGET_NAME}_obj)
+
+        add_library(${OBJ_NAME} OBJECT ${SOURCES} ${HEADERS})
+        ov_link_system_libraries(${OBJ_NAME} PUBLIC openvino::pugixml)
+
+        ov_add_version_defines(src/version.cpp ${OBJ_NAME})
+
+        target_include_directories(${OBJ_NAME}
+            PRIVATE
+                $<TARGET_PROPERTY:openvino::runtime::dev,INTERFACE_INCLUDE_DIRECTORIES>
+                $<TARGET_PROPERTY:openvino::itt,INTERFACE_INCLUDE_DIRECTORIES>
+            PUBLIC
+                ${CMAKE_CURRENT_SOURCE_DIR}/src
+                $<TARGET_PROPERTY:openvino::conditional_compilation,INTERFACE_INCLUDE_DIRECTORIES>)
+
+        ov_set_threading_interface_for(${OBJ_NAME})
+
+        target_compile_definitions(${OBJ_NAME} PRIVATE USE_STATIC_IE IMPLEMENT_OPENVINO_RUNTIME_PLUGIN)
+    endif()
+
+    add_subdirectory(tests)
+endif()

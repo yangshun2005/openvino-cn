@@ -1,0 +1,226 @@
+# Copyright (C) 2018-2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+
+#------------------------------------------------------------------------------
+# Configure Google Protobuf ...
+#------------------------------------------------------------------------------
+
+set(OV_SAVED_CXX_STANDARD_LIBRARIES "${CMAKE_CXX_STANDARD_LIBRARIES}")
+set(OV_SAVED_C_STANDARD_LIBRARIES "${CMAKE_C_STANDARD_LIBRARIES}")
+
+if(OV_EXPLICIT_ATOMIC_LIB)
+  set(CMAKE_CXX_STANDARD_LIBRARIES
+      "${CMAKE_CXX_STANDARD_LIBRARIES} ${OV_EXPLICIT_ATOMIC_LIB}")
+
+  set(CMAKE_C_STANDARD_LIBRARIES
+      "${CMAKE_C_STANDARD_LIBRARIES} ${OV_EXPLICIT_ATOMIC_LIB}")
+endif()
+
+if(ENABLE_THREAD_SANITIZER AND OV_COMPILER_IS_CLANG)
+    string(REPLACE "-ltsan" "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+    string(REPLACE "-shared-libsan" "" CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS}")
+    # protobuf 26 vendors abseil/utf8_range; disable TSan for the whole subtree so
+    # instrumented deps can't leak into the -fno-sanitize=thread protoc link
+    string(APPEND CMAKE_C_FLAGS   " -fno-sanitize=thread")
+    string(APPEND CMAKE_CXX_FLAGS " -fno-sanitize=thread")
+    string(REPLACE "-shared-libsan" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+endif()
+
+set(BUILD_SHARED_LIBS OFF)
+
+if(CMAKE_COMPILER_IS_GNUCXX OR OV_COMPILER_IS_CLANG OR (OV_COMPILER_IS_INTEL_LLVM AND UNIX))
+    ov_add_compiler_flags(-Wno-all)
+    if(CMAKE_COMPILER_IS_GNUCXX)
+        ov_add_compiler_flags(-fpermissive)
+        ov_add_compiler_flags(-funsigned-char)
+    endif()
+    if(CMAKE_CXX_COMPILER_VERSION VERSION_GREATER_EQUAL 11 AND CMAKE_COMPILER_IS_GNUCXX)
+        ov_add_compiler_flags(-Wno-stringop-overflow)
+        ov_add_compiler_flags(-Wno-ignored-qualifiers)
+        ov_add_compiler_flags(-Wno-deprecated-declarations)
+        ov_add_compiler_flags(-Wno-attributes)
+        ov_add_compiler_flags(-Wno-sign-conversion)
+        ov_add_compiler_flags(-Wno-array-bounds)
+    endif()
+    if(OV_COMPILER_IS_CLANG)
+        ov_add_compiler_flags(-Wno-sign-conversion)
+    endif()
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    ov_add_compiler_flags(/wd4703)
+endif()
+
+set(protobuf_VERBOSE ON)
+set(protobuf_BUILD_TESTS OFF CACHE BOOL "Build tests" FORCE)
+set(protobuf_BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libs" FORCE)
+set(protobuf_WITH_ZLIB OFF CACHE BOOL "Build with zlib support" FORCE)
+set(ABSL_PROPAGATE_CXX_STD ON CACHE BOOL "Abseil protogate CXX standard to dependent targets" FORCE)
+# Disable protobuf's own install/export rules.  OpenVINO installs and exports
+# libprotobuf/libprotobuf-lite via ov_install_static_lib → OpenVINOTargets.
+set(protobuf_INSTALL OFF CACHE BOOL "Disable protobuf self-install (managed by OpenVINO)" FORCE)
+# utf8_range.cmake sets utf8_range_ENABLE_INSTALL from protobuf_INSTALL but
+# without FORCE, so a stale ON value in the cache survives even when protobuf_INSTALL=OFF
+set(utf8_range_ENABLE_INSTALL OFF CACHE BOOL "Disable utf8_range self-install (managed by OpenVINO)" FORCE)
+
+# some projects define HAVE_ZLIB, which affects protobuf. Let's explicitly unset it
+unset(HAVE_ZLIB CACHE)
+
+# note: HOST_AARCH64 AND X86_64 are not handled for Apple explicitly, because it can work via Rosetta
+if(CMAKE_CROSSCOMPILING OR
+    (APPLE AND (HOST_X86_64 AND AARCH64)) OR
+    (MSVC AND (HOST_X86_64 AND (AARCH64 OR ARM))))
+    set(protobuf_BUILD_PROTOC_BINARIES OFF CACHE BOOL "Build protoc binaries" FORCE)
+else()
+    set(protobuf_BUILD_PROTOC_BINARIES ON CACHE BOOL "Build protoc binaries" FORCE)
+endif()
+
+# When we build dll libraries. These flags make sure onnx and protobuf build with /MD, not /MT.
+# These two options can't be mixed, because they requires link two incompatible runtime.
+if(NOT DEFINED protobuf_MSVC_STATIC_RUNTIME)
+    set(protobuf_MSVC_STATIC_RUNTIME OFF CACHE BOOL "Link protobuf to static runtime libraries" FORCE)
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/protobuf/CMakeLists.txt")
+    set(protobuf_dir protobuf)
+else()
+    set(protobuf_dir protobuf/cmake)
+endif()
+
+set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
+
+include("${CMAKE_CURRENT_LIST_DIR}/../patches.cmake")
+
+# Protobuf 6.30 unconditionally sets ABSL_MSVC_STATIC_RUNTIME=ON for static
+# builds (protobuf_BUILD_SHARED_LIBS=OFF), ignoring protobuf_MSVC_STATIC_RUNTIME.
+# This causes abseil to compile with /MT while protobuf uses /MD, resulting in
+# LNK2038 "mismatch detected for RuntimeLibrary" on MSVC.  Patch protobuf's
+# CMakeLists.txt to propagate protobuf_MSVC_STATIC_RUNTIME to abseil.
+ov_apply_patch(
+    PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/0001-fix-absl-msvc-runtime.patch"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/protobuf")
+
+# Abseil 20250127 (bundled with protobuf 6.31) fails to build with some GCC
+# versions (e.g. the aarch64 cross toolchain and RHEL8) because of two constexpr
+# issues: raw_hash_set::GetPolicyFunctions() compares a function-template address
+# against nullptr in a 'static constexpr', and ascii.cc's ValidateAsciiCasefold()
+# self-test hits an implementation-defined signed-char conversion. Patch
+# protobuf's abseil-cpp.cmake so the FetchContent'd Abseil gets the source fixes
+# applied at populate time. This covers both this build and the native
+# host_protoc build, which share the same protobuf source tree.
+ov_apply_patch(
+    PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/0003-protobuf-absl-apply-openvino-patch.patch"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/protobuf")
+
+# Protobuf's JSON UntypedMessage stores a std::variant (which holds UntypedMessage
+# itself) in an absl::flat_hash_map member. Abseil's containers probe trivial-type
+# traits on the value_type at class instantiation, which requires the still-incomplete
+# UntypedMessage to be complete and breaks Clang + libstdc++ builds. Use a node-based
+# std::map, which accepts the incomplete mapped type.
+ov_apply_patch(
+    PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/0004-protobuf-untyped-message-stdmap.patch"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/protobuf")
+
+# protoc's Java generator keeps absl::flat_hash_map members of FieldGeneratorInfo /
+# OneofGeneratorInfo while those structs are only forward-declared. Abseil probes
+# trivial-type traits on the value_type at class instantiation, which needs the type
+# complete and breaks Clang + libstdc++. Include field_common.h to complete them.
+ov_apply_patch(
+    PATCH "${CMAKE_CURRENT_SOURCE_DIR}/patches/0005-protobuf-java-context-complete-types.patch"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/protobuf")
+
+add_subdirectory(${protobuf_dir} EXCLUDE_FROM_ALL)
+get_directory_property(protobuf_VERSION DIRECTORY ${protobuf_dir} DEFINITION protobuf_VERSION)
+
+set(Protobuf_INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/protobuf/src)
+
+include(GNUInstallDirs)
+
+# Mimic protobuf's cmake/install.cmake
+foreach(_proto_lib IN ITEMS libprotobuf libprotobuf-lite)
+    if(TARGET "${_proto_lib}")
+        set_property(TARGET "${_proto_lib}"
+            PROPERTY INTERFACE_INCLUDE_DIRECTORIES
+            "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/protobuf/src>"
+            "$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>")
+    endif()
+endforeach()
+unset(_proto_lib)
+
+# to hide libprotobuf warnings
+target_include_directories(libprotobuf-lite SYSTEM PRIVATE "${Protobuf_INCLUDE_DIRS}")
+
+if(CMAKE_COMPILER_IS_GNUCXX OR OV_COMPILER_IS_CLANG OR OV_COMPILER_IS_INTEL_LLVM)
+    if(protobuf_BUILD_PROTOC_BINARIES)
+        list(APPEND _protoc_libs protoc libprotoc libprotobuf)
+        set_target_properties(${_protoc_libs} PROPERTIES
+            INTERPROCEDURAL_OPTIMIZATION_RELEASE OFF)
+        if(NOT APPLE)
+            set_target_properties(${_protoc_libs} PROPERTIES
+                CXX_VISIBILITY_PRESET default
+                C_VISIBILITY_PRESET default
+                VISIBILITY_INLINES_HIDDEN OFF)
+        endif()
+    endif()
+    # protobuf is incompatible with thread sanitizers
+    if(ENABLE_THREAD_SANITIZER)
+        foreach(_lib protoc libprotoc libprotobuf libprotobuf-lite)
+            if(TARGET ${_lib})
+                target_compile_options(${_lib} PRIVATE -fno-sanitize=thread)
+                target_link_options(${_lib} PRIVATE -fno-sanitize=thread)
+            endif()
+        endforeach()
+    endif()
+    ov_disable_all_warnings(${_protoc_libs} libprotobuf-lite)
+    set_target_properties(libprotobuf-lite PROPERTIES
+        INTERPROCEDURAL_OPTIMIZATION_RELEASE ${ENABLE_LTO})
+endif()
+
+if(protobuf_VERSION VERSION_LESS 3.9)
+    message(FATAL_ERROR "Minimum supported version of protobuf-lite library is 3.9.0 (provided ${protobuf_VERSION})")
+endif()
+
+# build protoc separatelly for build system processor
+
+if(NOT protobuf_BUILD_PROTOC_BINARIES)
+    set(HOST_PROTOC_INSTALL_DIR "${CMAKE_CURRENT_BINARY_DIR}/install")
+
+    if(ENABLE_THREAD_SANITIZER)
+        set(protoc_extra_flags "-fno-sanitize=thread")
+    endif()
+
+    if(CMAKE_COMPILER_IS_GNUCXX)
+        set(protoc_extra_flags "${protoc_extra_flags} -fpermissive")
+    endif()
+
+    set(PROTOC_EXECUTABLE "${HOST_PROTOC_INSTALL_DIR}/bin/protoc")
+
+    ov_native_compile_external_project(
+        TARGET_NAME host_protoc
+        NATIVE_INSTALL_DIR "${HOST_PROTOC_INSTALL_DIR}"
+        EXTRA_COMPILE_FLAGS "${protoc_extra_flags}"
+        CMAKE_ARGS "-Dprotobuf_VERBOSE=${protobuf_VERBOSE}"
+                   "-Dprotobuf_BUILD_TESTS=${protobuf_BUILD_TESTS}"
+                   "-Dprotobuf_WITH_ZLIB=${protobuf_WITH_ZLIB}"
+        NATIVE_SOURCE_SUBDIR "${protobuf_dir}"
+        NATIVE_TARGETS protoc libprotobuf-lite
+        BUILD_BYPRODUCTS "${PROTOC_EXECUTABLE}")
+
+    add_executable(protobuf::protoc IMPORTED GLOBAL)
+    set_property(TARGET protobuf::protoc APPEND PROPERTY IMPORTED_CONFIGURATIONS RELEASE)
+    set_target_properties(protobuf::protoc PROPERTIES
+        IMPORTED_LOCATION_RELEASE "${PROTOC_EXECUTABLE}")
+    set_target_properties(protobuf::protoc PROPERTIES
+        MAP_IMPORTED_CONFIG_DEBUG Release
+        MAP_IMPORTED_CONFIG_MINSIZEREL Release
+        MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release)
+    add_dependencies(protobuf::protoc host_protoc)
+
+    set(PROTOC_DEPENDENCY host_protoc PARENT_SCOPE)
+    set(PROTOC_EXECUTABLE "${PROTOC_EXECUTABLE}" PARENT_SCOPE)
+else()
+    set(PROTOC_EXECUTABLE $<TARGET_FILE:protoc> PARENT_SCOPE)
+    set(PROTOC_DEPENDENCY protoc PARENT_SCOPE)
+endif()
+
+set(CMAKE_CXX_STANDARD_LIBRARIES "${OV_SAVED_CXX_STANDARD_LIBRARIES}")
+set(CMAKE_C_STANDARD_LIBRARIES "${OV_SAVED_C_STANDARD_LIBRARIES}")

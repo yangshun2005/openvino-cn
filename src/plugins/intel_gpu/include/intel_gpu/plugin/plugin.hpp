@@ -1,0 +1,76 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+
+#include "openvino/runtime/iplugin.hpp"
+#include "intel_gpu/plugin/remote_context.hpp"
+#include "intel_gpu/runtime/engine.hpp"
+#include <map>
+#include <string>
+#include <memory>
+
+namespace ov::intel_gpu {
+
+class Plugin : public ov::IPlugin {
+private:
+    std::string m_default_device_id = "0";
+    std::map<std::string, cldnn::device::ptr> m_device_map;
+    std::map<std::string, ExecutionConfig> m_configs_map;
+    ov::AnyMap m_compiled_model_runtime_properties;
+
+    mutable std::map<std::string, std::shared_ptr<RemoteContextImpl>> m_default_contexts;
+    mutable std::once_flag m_default_contexts_once;
+
+    std::map<std::string, std::shared_ptr<RemoteContextImpl>> get_default_contexts() const;
+
+    // Rename our enumerated devices to the ids Core assigned (ov::internal::device_id_map).
+    void apply_device_id_map(const std::map<std::string, std::string>& id_map);
+
+    static std::shared_ptr<ov::Model> clone_and_transform_model(const std::shared_ptr<const ov::Model>& model,
+                                                                ExecutionConfig& config,
+                                                                const std::shared_ptr<RemoteContextImpl>& context);
+    static void transform_model(std::shared_ptr<ov::Model>& model, const ExecutionConfig& config, const std::shared_ptr<RemoteContextImpl>& context);
+    static void register_primitives();
+    static bool is_weightless_cache_attributes_set(const std::shared_ptr<const ov::Model>& model);
+    static void set_weightless_cache_attributes(const std::shared_ptr<const ov::Model>& model);
+    static void create_weightless_cache_attributes(const std::shared_ptr<const ov::Model>& model, ExecutionConfig& config);
+    static std::string get_device_id_from_config(const ov::AnyMap& config);
+    std::string get_device_id(const ov::AnyMap& config) const;
+    std::shared_ptr<RemoteContextImpl> get_default_context(const std::string& device_id, bool initialize = true) const;
+
+    static std::vector<ov::PropertyName> get_caching_properties();
+    static std::vector<ov::PropertyName> get_supported_properties();
+    static std::vector<ov::PropertyName> get_supported_internal_properties();
+    static std::vector<std::string> get_device_capabilities(const cldnn::device_info& info);
+    uint32_t get_optimal_batch_size(const ov::AnyMap& options) const;
+    uint32_t get_max_batch_size(const ov::AnyMap& options) const;
+
+    static bool is_metric(const std::string& name);
+    ov::Any get_metric(const std::string& name, const ov::AnyMap& options) const;
+
+public:
+    Plugin();
+
+    std::shared_ptr<ov::ICompiledModel> compile_model(const std::shared_ptr<const ov::Model>& model, const ov::AnyMap& orig_config) const override;
+    std::shared_ptr<ov::ICompiledModel> compile_model(const std::shared_ptr<const ov::Model>& model,
+                                                      const ov::AnyMap& orig_config,
+                                                      const ov::SoPtr<ov::IRemoteContext>& context) const override;
+
+    void set_property(const ov::AnyMap& config) override;
+    ov::Any get_property(const std::string& name, const ov::AnyMap& options) const override;
+    std::shared_ptr<ov::ICompiledModel> import_model(std::istream& model, const ov::AnyMap& config) const override;
+    std::shared_ptr<ov::ICompiledModel> import_model(std::istream& model,
+                                                     const ov::SoPtr<ov::IRemoteContext>& context,
+                                                     const ov::AnyMap& orig_config) const override;
+    std::shared_ptr<ov::ICompiledModel> import_model(const ov::Tensor& model, const ov::AnyMap& config) const override;
+    std::shared_ptr<ov::ICompiledModel> import_model(const ov::Tensor& model,
+                                                     const ov::SoPtr<ov::IRemoteContext>& context,
+                                                     const ov::AnyMap& config) const override;
+    ov::SupportedOpsMap query_model(const std::shared_ptr<const ov::Model>& model, const ov::AnyMap& orig_config) const override;
+    ov::SoPtr<ov::IRemoteContext> create_context(const ov::AnyMap& remote_properties) const override;
+    ov::SoPtr<ov::IRemoteContext> get_default_context(const ov::AnyMap& params) const override;
+};
+
+}  // namespace ov::intel_gpu

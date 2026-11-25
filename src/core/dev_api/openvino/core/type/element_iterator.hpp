@@ -1,0 +1,535 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+
+#include "openvino/core/type/element_type_traits.hpp"
+#include "openvino/core/type/nf4.hpp"
+
+namespace ov {
+namespace util {
+
+/**
+ * @brief Make bit mask by setting N less significant bits.
+ *
+ * @tparam T Type of value.
+ * @param n  Number of bits to set.
+ * @return   Bit-mask value with N bits set.
+ */
+template <class T>
+constexpr T make_n_bit_mask(const T n) {
+    return (1ULL << n) - 1ULL;
+}
+}  // namespace util
+
+namespace element {
+
+/**
+ * @brief Checks if element type is N in-raw bits type.
+ *
+ * The values are packed as a linear bit-stream, value `i` occupies bits `[i * bitwidth, i * bitwidth + bitwidth)`
+ * and can straddle a byte boundary if the bit width is not a divisor of 8 (u3, u6).
+ *
+ * @param et  Element type to check
+ * @return True if element type is bit type otherwise false.
+ */
+constexpr bool is_bit_type(Type_t et) {
+    return et == u1 || et == u2 || et == u3 || et == u6;
+}
+
+/**
+ * @brief Checks if element type is 4-bits type.
+ *
+ * @param et  Element type to check
+ * @return True if element type is nibble type otherwise false.
+ */
+constexpr bool is_nibble_type(Type_t et) {
+    return et == u4 || et == i4 || et == nf4 || et == f4e2m1;
+}
+
+/**
+ * @brief Checks element type is using only N bytes as value.
+ *
+ * @param et  Element type to check.
+ * @return True if element type use byte(s) for its value, false otherwise.
+ */
+constexpr bool is_byte_type(Type_t et) {
+    return !is_bit_type(et) && !is_nibble_type(et) && et != string;
+}
+
+/**
+ * @brief Checks if type is packet in byte from LSB -> MSB order.
+ *
+ * @param et  Element type to check.
+ * @return True if type is packet LSB first, false otherwise.
+ */
+constexpr bool is_lsb_packed(Type_t et) {
+    return et != u1;
+}
+
+/**
+ * @brief Gets bit width of ov::element::Type_t.
+ *
+ * @return Number of bits representing the Type_t.
+ */
+template <Type_t ET>
+constexpr size_t bit_width() {
+    return sizeof(typename ov::fundamental_type_for<ET>());
+}
+
+template <>
+constexpr size_t bit_width<Type_t::u1>() {
+    return 1;
+}
+
+template <>
+constexpr size_t bit_width<Type_t::u2>() {
+    return 2;
+}
+
+template <>
+constexpr size_t bit_width<Type_t::u3>() {
+    return 3;
+}
+
+template <>
+constexpr size_t bit_width<Type_t::u4>() {
+    return 4;
+}
+
+template <>
+constexpr size_t bit_width<Type_t::nf4>() {
+    return 4;
+}
+
+template <>
+constexpr size_t bit_width<Type_t::i4>() {
+    return 4;
+}
+
+template <>
+constexpr size_t bit_width<Type_t::u6>() {
+    return 6;
+}
+
+template <>
+constexpr size_t bit_width<Type_t::f4e2m1>() {
+    return 4;
+}
+
+/**
+ * @brief The BitProxy value class used by ov::element::Iterator to access values which has no standard byte(s) layout.
+ *
+ * It used by iterator to access values represented by precisions like u1, u2, u3, i4, u6 etc. in the way like stored
+ * on bytes.
+ * The R/W access is done via conversion and copy assignment operators.
+ * The public members are used to work on sub-byte value like on its fundamental type defined by T.
+ *
+ * @tparam T       Fundamental type of sub-byte value which must be same as fundamental type of element::Type_t.
+ * @tparam ET      OpenVINO element type.
+ * @tparam Enable  Type to enable/disable this class.
+ */
+template <class T, Type_t ET, class Enable = void>
+class BitProxy {};
+
+/**
+ * @brief The BitProxy specialization for types which are represented by N bits in the packed bit-stream.
+ *
+ * @tparam T  Fundamental type of sub-byte value which must be same as fundamental type of element::Type_t.
+ * @tparam ET OpenVINO element type.
+ */
+template <class T, Type_t ET>
+class BitProxy<T, ET, std::enable_if_t<is_bit_type(ET) || is_nibble_type(ET)>> {
+private:
+    template <Type_t, class>
+    friend class Iterator;  //!< Iterator class is friend to access private members to manipulate pointer.
+
+    using Bits = std::conditional_t<std::is_const_v<T>, const uint8_t, uint8_t>;
+
+    static constexpr size_t m_bits = bit_width<ET>();                           //!< Number of bit for single value.
+    static constexpr bool m_straddles_bytes = (8 % m_bits) != 0;                //!< Value can span two bytes.
+    static constexpr size_t m_num_values = 8 / m_bits;                          //!< Number values in byte.
+    static constexpr size_t m_shift_init = is_lsb_packed(ET) ? 0 : 8 - m_bits;  //!< Initial value for bit shift.
+
+    Bits* m_ptr;         //!< Pointer to T as Bits used to get value from bits.
+    size_t m_bit_shift;  //!< Current bit shift to get value.
+
+    constexpr BitProxy(T* ptr) noexcept : m_ptr{reinterpret_cast<Bits*>(ptr)}, m_bit_shift{m_shift_init} {}
+
+    uint8_t get_bit_value() const {
+        constexpr auto value_mask = util::make_n_bit_mask(m_bits);
+        if constexpr (m_straddles_bytes) {
+            // Read the next byte only if the value spans it, to not access memory past the buffer end.
+            auto bits = static_cast<uint16_t>(m_ptr[0]);
+            if (m_bit_shift + m_bits > 8) {
+                bits |= static_cast<uint16_t>(m_ptr[1]) << 8U;
+            }
+            return static_cast<uint8_t>((bits >> m_bit_shift) & value_mask);
+        } else {
+            return (*m_ptr >> m_bit_shift) & value_mask;
+        }
+    }
+
+    void set_bit_value(uint8_t value) {
+        constexpr auto value_mask = util::make_n_bit_mask(m_bits);
+        if constexpr (m_straddles_bytes) {
+            const auto shifted_mask = static_cast<uint16_t>(value_mask << m_bit_shift);
+            const auto shifted_value = static_cast<uint16_t>(value << m_bit_shift);
+
+            m_ptr[0] = static_cast<uint8_t>((m_ptr[0] & ~static_cast<uint8_t>(shifted_mask)) |
+                                            static_cast<uint8_t>(shifted_value));
+            if (m_bit_shift + m_bits > 8) {
+                m_ptr[1] = static_cast<uint8_t>((m_ptr[1] & ~static_cast<uint8_t>(shifted_mask >> 8U)) |
+                                                static_cast<uint8_t>(shifted_value >> 8U));
+            }
+        } else {
+            *m_ptr &= ~(value_mask << m_bit_shift);
+            *m_ptr |= value << m_bit_shift;
+        }
+    }
+
+public:
+    using value_type = std::decay_t<T>;  //!< Fundamental type of bound to BitProxy.
+
+    /**
+     * @brief Compare proxy value with other provided value.
+     * @param rhs  Value to compare.
+     * @return True if equal otherwise false.
+     */
+    template <class U>
+    constexpr bool operator==(const U& rhs) const {
+        return static_cast<value_type>(*this) == rhs;
+    }
+
+    /**
+     * @brief Compare proxy value is less than rhs.
+     *
+     * @tparam U   Type of value to compare.
+     * @param rhs  Value to compare.
+     * @return True if less otherwise false.
+     */
+    template <class U>
+    constexpr bool operator<(const U& rhs) const {
+        return static_cast<value_type>(*this) < rhs;
+    }
+
+    /**
+     * @brief Converts to fundamental type.
+     *
+     * @return Value of BitProxy.
+     */
+    template <Type_t ETT = ET, std::enable_if_t<ETT != i4 && ETT != f4e2m1>* = nullptr>
+    operator value_type() const {
+        return static_cast<value_type>(get_bit_value());
+    }
+
+    /**
+     * @brief Converts to fundamental type.
+     *
+     * @return Value of BitProxy.
+     */
+    template <Type_t ETT = ET, std::enable_if_t<ETT == f4e2m1>* = nullptr>
+    operator value_type() const {
+        return value_type::from_bits(get_bit_value());
+    }
+
+    /**
+     * @brief Converts to float for NF4.
+     *
+     * @note Implementation aligned to ConvertNF4::unpack, de-quantization applied only when converting to
+     * floating point.  For integral types get bit value.
+     *
+     * @return Converted NF4 value to float.
+     */
+    template <Type_t ETT = ET, std::enable_if_t<ETT == nf4>* = nullptr>
+    operator float() const {
+        return ConvertNF4::dequantize(get_bit_value());
+    }
+
+    template <Type_t ETT = ET, std::enable_if_t<ETT == f4e2m1>* = nullptr>
+    operator float() const {
+        return static_cast<float>(float4_e2m1::from_bits(get_bit_value()));
+    }
+
+    /**
+     * @brief Converts to fundamental type.
+     *
+     * @return Value of BitProxy.
+     */
+    template <Type_t ETT = ET, std::enable_if_t<ETT == i4>* = nullptr>
+    operator value_type() const {
+        constexpr auto value_mask = util::make_n_bit_mask(m_bits);
+        constexpr auto value_msb_mask = (1U << (m_bits - 1U));
+
+        auto v = get_bit_value();
+        if (v & value_msb_mask) {
+            // If N bit value MSB bit is set then value is negative.
+            // As v is byte then all bits above N must be set to be two's complement.
+            v |= ~value_mask;
+        }
+        return static_cast<value_type>(v);
+    }
+
+    /**
+     * @brief Sets current ProxyBit to value.
+     * @param v  Value to be set.
+     */
+    template <Type_t ETT = ET, std::enable_if_t<ETT != f4e2m1>* = nullptr>
+    BitProxy<T, ET>& operator=(const value_type v) {
+        constexpr auto value_mask = util::make_n_bit_mask(m_bits);
+        set_bit_value(static_cast<uint8_t>(v) & value_mask);
+        return *this;
+    }
+
+    /**
+     * @brief Sets current ProxyBit to value (f4e2m1 specialization).
+     * @param v  Value to be set.
+     */
+    template <Type_t ETT = ET, std::enable_if_t<ETT == f4e2m1>* = nullptr>
+    BitProxy<T, ET>& operator=(const value_type v) {
+        set_bit_value(v.to_bits());
+        return *this;
+    }
+
+    /**
+     * @brief Sets current NF4 value from float using quantization.
+     * @param v  Value to be set.
+     */
+    template <Type_t ETT = ET, std::enable_if_t<ETT == nf4>* = nullptr>
+    BitProxy<T, ET>& operator=(const float v) {
+        set_bit_value(ConvertNF4::quantize(v));
+        return *this;
+    }
+};
+
+/**
+ * @brief Put BitProxy value to output stream.
+ *
+ * @param os    Reference to output stream.
+ * @param value Value to print.
+ * @return return output stream.
+ */
+template <class T, Type_t ET>
+std::ostream& operator<<(std::ostream& os, const BitProxy<T, ET>& value) {
+    os << +static_cast<T>(value);
+    return os;
+}
+
+/**
+ * @brief Bidirectional iterator of specified precision.
+ *
+ * The iterator supports low precisions using BitProxy to access values via conversion.
+ *
+ * @tparam ET  Type of OpenVINO element type (ov::element::Type_t).
+ * @tparam T   Must be fundamental type for specified ET.
+ */
+template <Type_t ET, class T>
+class Iterator {
+    using proxy_type = BitProxy<T, ET>;
+
+public:
+    using iterator_category = std::bidirectional_iterator_tag;
+    using difference_type = std::ptrdiff_t;
+    using value_type = T;
+    using reference = std::conditional_t<std::is_const<T>::value, const proxy_type&, proxy_type&>;
+    using pointer = std::conditional_t<std::is_const<T>::value, const proxy_type*, proxy_type*>;
+
+    static_assert(std::is_same_v<std::decay_t<T>, ov::fundamental_type_for<ET>>,
+                  "Iterator value_type must be same as fundamental type of ET");
+
+    constexpr Iterator(T* ptr) noexcept : m_et_ptr{ptr} {}
+
+    template <class U>
+    constexpr Iterator(U* ptr) noexcept : m_et_ptr{reinterpret_cast<T*>(ptr)} {
+        static_assert(std::is_same_v<typename std::decay_t<U>, int8_t>,
+                      "User type must be int8_t as base type for LP ET");
+    }
+
+    // Iteration operators
+    Iterator<ET, T>& operator++() {
+        if constexpr (is_nibble_type(ET)) {
+            m_et_ptr.m_bit_shift ^= m_et_ptr.m_bits;
+            m_et_ptr.m_ptr += static_cast<std::ptrdiff_t>(m_et_ptr.m_bit_shift == m_et_ptr.m_shift_init);
+        } else if constexpr (is_lsb_packed(ET)) {
+            m_et_ptr.m_bit_shift += m_et_ptr.m_bits;
+            m_et_ptr.m_ptr += static_cast<std::ptrdiff_t>(m_et_ptr.m_bit_shift / 8);
+            m_et_ptr.m_bit_shift %= 8;
+        } else {
+            m_et_ptr.m_bit_shift -= m_et_ptr.m_bits;
+            m_et_ptr.m_bit_shift = m_et_ptr.m_bit_shift % 8;
+            m_et_ptr.m_ptr += static_cast<std::ptrdiff_t>(m_et_ptr.m_bit_shift == m_et_ptr.m_shift_init);
+        }
+        return *this;
+    }
+
+    Iterator<ET, T> operator++(int) {
+        auto old = *this;
+        ++(*this);
+        return old;
+    }
+
+    Iterator<ET, T>& operator+=(const difference_type& n) {
+        if constexpr (is_nibble_type(ET)) {
+            m_et_ptr.m_ptr += n / m_et_ptr.m_num_values;
+            if (n % m_et_ptr.m_num_values) {
+                ++*this;
+            }
+        } else if constexpr (is_lsb_packed(ET)) {
+            const auto advance =
+                static_cast<difference_type>(m_et_ptr.m_bit_shift) + n * static_cast<difference_type>(m_et_ptr.m_bits);
+            m_et_ptr.m_bit_shift = static_cast<size_t>(advance % 8);
+            m_et_ptr.m_ptr += advance / 8;
+        } else {
+            const auto advance = n + (m_et_ptr.m_shift_init - m_et_ptr.m_bit_shift) / m_et_ptr.m_bits;
+            m_et_ptr.m_bit_shift = m_et_ptr.m_shift_init - (advance % m_et_ptr.m_num_values) * m_et_ptr.m_bits;
+            m_et_ptr.m_ptr += advance / m_et_ptr.m_num_values;
+        }
+        return *this;
+    }
+
+    Iterator<ET, T> operator+(const difference_type& n) const {
+        auto tmp(*this);
+        tmp += n;
+        return tmp;
+    }
+
+    Iterator<ET, T>& operator--() {
+        if constexpr (is_nibble_type(ET)) {
+            m_et_ptr.m_bit_shift ^= m_et_ptr.m_bits;
+            m_et_ptr.m_ptr -= static_cast<std::ptrdiff_t>(m_et_ptr.m_bit_shift == 4);
+        } else if constexpr (is_lsb_packed(ET)) {
+            // Biased by one byte to keep the arithmetic unsigned when the value starts in the previous byte.
+            const auto shift = m_et_ptr.m_bit_shift + 8 - m_et_ptr.m_bits;
+            m_et_ptr.m_ptr += static_cast<std::ptrdiff_t>(shift / 8) - 1;
+            m_et_ptr.m_bit_shift = shift % 8;
+        } else {
+            m_et_ptr.m_bit_shift += m_et_ptr.m_bits;
+            m_et_ptr.m_bit_shift = m_et_ptr.m_bit_shift % 8;
+            m_et_ptr.m_ptr -= static_cast<std::ptrdiff_t>(m_et_ptr.m_bit_shift == 0);
+        }
+        return *this;
+    }
+
+    Iterator<ET, T> operator--(int) {
+        auto old = *this;
+        --(*this);
+        return old;
+    }
+
+    Iterator<ET, T>& operator-=(const difference_type& n) {
+        if constexpr (is_nibble_type(ET)) {
+            m_et_ptr.m_ptr -= n / m_et_ptr.m_num_values;
+            if (n % m_et_ptr.m_num_values) {
+                --*this;
+            }
+        } else if constexpr (is_lsb_packed(ET)) {
+            const auto advance =
+                n * static_cast<difference_type>(m_et_ptr.m_bits) - static_cast<difference_type>(m_et_ptr.m_bit_shift);
+            m_et_ptr.m_bit_shift = static_cast<size_t>((8 - advance % 8) % 8);
+            m_et_ptr.m_ptr -= (advance + 7) / 8;
+        } else {
+            const auto advance = m_et_ptr.m_bit_shift / m_et_ptr.m_bits + n;
+            m_et_ptr.m_bit_shift = (advance % m_et_ptr.m_num_values) * m_et_ptr.m_bits;
+            m_et_ptr.m_ptr -= advance / m_et_ptr.m_num_values;
+        }
+        return *this;
+    }
+
+    Iterator<ET, T> operator-(const difference_type& n) const {
+        auto tmp(*this);
+        tmp -= n;
+        return tmp;
+    }
+
+    // compare operators
+    constexpr bool operator!=(const Iterator<ET, T>& rhs) const {
+        return (m_et_ptr.m_ptr != rhs.m_et_ptr.m_ptr) || (m_et_ptr.m_bit_shift != rhs.m_et_ptr.m_bit_shift);
+    }
+
+    // dereference operators
+    constexpr const proxy_type& operator*() const {
+        return m_et_ptr;
+    }
+
+    reference operator*() {
+        return m_et_ptr;
+    }
+
+private:
+    proxy_type m_et_ptr;
+};
+
+/**
+ * @brief Make element iterator from pointer.
+ *
+ * @tparam ET  Type of ov::element::Type_t.
+ * @tparam T   Type of pointer data. Must be fundamental type of ET.
+ *
+ * @param ptr  Pointer to data.
+ * @return Element iterator for type ET.
+ */
+template <Type_t ET, class T, typename std::enable_if<!is_byte_type(ET) && ET != string>::type* = nullptr>
+constexpr Iterator<ET, ov::fundamental_type_for<ET>> iterator(T* ptr) {
+    return {ptr};
+}
+
+/**
+ * @brief Make element iterator from pointer.
+ *
+ * @tparam ET  Type of ov::element::Type_t.
+ * @tparam T   Type of pointer data. Must be fundamental type of ET.
+ *
+ * @param ptr  Pointer to data.
+ * @return Element iterator for type ET.
+ */
+template <Type_t ET, class T, typename std::enable_if<!is_byte_type(ET) && ET != string>::type* = nullptr>
+constexpr Iterator<ET, const ov::fundamental_type_for<ET>> iterator(const T* ptr) {
+    return {ptr};
+}
+
+/**
+ * @brief Make iterator from pointer for standard types.
+ *
+ * To have common interface for all ov::element::Type. Just return input pointer.
+ *
+ * @tparam ET  Type of ov::element::Type_t.
+ * @tparam T   Type of pointer data. Must be fundamental type of ET.
+ *
+ * @param ptr  Pointer to data.
+ * @return Element iterator same as input pointer.
+ */
+template <Type_t ET, class T, typename std::enable_if<is_byte_type(ET) || ET == string>::type* = nullptr>
+constexpr T* iterator(T* ptr) {
+    return ptr;
+}
+
+/**
+ * @brief Make iterator from void pointer.
+ *
+ * Data will be reinterpreted using fundamental type for ov::element::Type.
+ *
+ * @tparam ET  OpenVINO element type.
+ * @param ptr  Pointer to data.
+ * @return Iterator for given ET.
+ */
+template <Type_t ET, class T = ov::fundamental_type_for<ET>>
+constexpr auto iterator(void* ptr) -> decltype(iterator<ET, T>(reinterpret_cast<T*>(ptr))) {
+    return iterator<ET, T>(reinterpret_cast<T*>(ptr));
+}
+
+/**
+ * @brief Make iterator from constant void pointer.
+ *
+ * Data will be reinterpreted using fundamental type for ov::element::Type.
+ *
+ * @tparam ET  OpenVINO element type.
+ * @param ptr  Pointer to data.
+ * @return Iterator for given ET.
+ */
+template <Type_t ET, class T = typename std::add_const<ov::fundamental_type_for<ET>>::type>
+constexpr auto iterator(const void* ptr) -> decltype(iterator<ET, T>(reinterpret_cast<T*>(ptr))) {
+    return iterator<ET, T>(reinterpret_cast<T*>(ptr));
+}
+}  // namespace element
+}  // namespace ov

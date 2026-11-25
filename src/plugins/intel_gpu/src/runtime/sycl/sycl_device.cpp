@@ -1,0 +1,374 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+// Copyright (C) 2026 FUJITSU LIMITED
+//
+
+#if defined(ENABLE_ONEDNN_FOR_GPU) && defined(OV_GPU_VENDOR_INTEL)
+#ifndef NOMINMAX
+# define NOMINMAX
+#endif
+#include "gpu/intel/jit/generator.hpp"
+#endif  // ENABLE_ONEDNN_FOR_GPU
+
+#include "sycl_device.hpp"
+#include "sycl_common.hpp"
+#include "driver_dev_id.hpp"
+#include "intel_gpu/runtime/debug_configuration.hpp"
+
+#include <map>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
+#include <string>
+#include <cassert>
+#include <time.h>
+#include <limits>
+#include <chrono>
+#include <fstream>
+#include <iostream>
+#include <optional>
+#include <sstream>
+#include <utility>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <cstring>
+#else
+#include <unistd.h>
+#include <limits.h>
+#include <link.h>
+#include <dlfcn.h>
+#endif
+
+#if SYCL_EXT_ONEAPI_MATRIX
+#include <sycl/ext/oneapi/matrix/matrix.hpp>
+#endif // SYCL_EXT_ONEAPI_MATRIX
+
+namespace cldnn {
+namespace sycl {
+
+namespace {
+
+#if defined(ENABLE_ONEDNN_FOR_GPU) && defined(OV_GPU_VENDOR_INTEL)
+gpu_arch convert_ngen_arch(ngen::HW gpu_arch) {
+    switch (gpu_arch) {
+        case ngen::HW::Gen9: return gpu_arch::gen9;
+        case ngen::HW::Gen11: return gpu_arch::gen11;
+        case ngen::HW::XeLP: return gpu_arch::xe_lp;
+        case ngen::HW::XeHP: return gpu_arch::xe_hp;
+        case ngen::HW::XeHPG: return gpu_arch::xe_hpg;
+        case ngen::HW::XeHPC: OPENVINO_THROW("[GPU] XeHPC is not supported");
+        case ngen::HW::Xe2: return gpu_arch::xe2;
+        case ngen::HW::Xe3: return gpu_arch::xe3;
+        case ngen::HW::Xe3p: return gpu_arch::xe3p;
+        case ngen::HW::Gen10:
+        case ngen::HW::Unknown: return gpu_arch::unknown;
+    }
+    return gpu_arch::unknown;
+}
+#endif
+
+gfx_version parse_version(uint32_t gmdid) {
+    union GMDID {
+        uint32_t value;
+        struct {
+            uint32_t revision : 6;
+            uint32_t reserved : 8;
+            uint32_t release : 8;
+            uint32_t architecture : 10;
+        };
+    };
+
+    GMDID gmd_id = {gmdid};
+    if (gmd_id.architecture > 0 && gmd_id.architecture < 100) {
+        // New format
+        return {static_cast<uint16_t>(gmd_id.architecture), static_cast<uint8_t>(gmd_id.release), static_cast<uint8_t>(gmd_id.revision)};
+    }  // Old format
+    uint32_t ver = gmdid;
+    uint16_t major = ver >> 16;
+    uint8_t minor = (ver >> 8) & 0xFF;
+    uint8_t revision = ver & 0xFF;
+
+    return {major, minor, revision};
+}
+
+uint32_t query_device_ip_version(const ::sycl::device& device) {
+#if SYCL_EXT_ONEAPI_DEVICE_ARCHITECTURE
+    namespace syclex = ::sycl::ext::oneapi::experimental;
+
+    try {
+        // arch = 0xAABBBBCCCCCCCCDD
+        // for Intel GPU, AA=0x00, BBBB=reserved, CCCCCCCC=GMDID, DD=reserved
+        const auto arch = device.get_info<syclex::info::device::architecture>();
+
+        // extract GMDID from arch
+        return static_cast<uint32_t>(static_cast<uint64_t>(arch) >> 8);
+    } catch (const ::sycl::exception&) {
+        return 0;
+    }
+#else
+    (void)device;
+    return 0;
+#endif
+}
+
+std::optional<pci_bus_info> get_pci_bus_info(const ::sycl::device& device) {
+    if (!device.has(::sycl::aspect::ext_intel_pci_address)) {
+        return std::nullopt;
+    }
+
+    // The address has the BDF form, e.g. "0000:03:00.0"
+    std::istringstream pci_address(device.get_info<::sycl::ext::intel::info::device::pci_address>());
+    unsigned int domain = 0;
+    unsigned int bus = 0;
+    unsigned int dev = 0;
+    unsigned int function = 0;
+    char domain_separator = 0;
+    char bus_separator = 0;
+    char function_separator = 0;
+    pci_address >> std::hex >> domain >> domain_separator >> bus >> bus_separator >> dev >> function_separator >> function;
+    if (pci_address.fail() || pci_address.peek() != std::char_traits<char>::eof() || domain_separator != ':' ||
+        bus_separator != ':' || function_separator != '.' || bus > 0xff || dev > 0x1f || function > 7) {
+        return std::nullopt;
+    }
+    return pci_bus_info{domain, bus, dev, function};
+}
+
+device_type get_device_type(const ::sycl::device& device) {
+    OPENVINO_SUPPRESS_DEPRECATED_START
+    auto unified_mem = device.get_info<::sycl::info::device::host_unified_memory>();
+    OPENVINO_SUPPRESS_DEPRECATED_END
+
+    return unified_mem ? device_type::integrated_gpu : device_type::discrete_gpu;
+}
+
+bool get_imad_support(const ::sycl::device& device) {
+    std::string dev_name = device.get_info<::sycl::info::device::name>();
+
+    if (dev_name.find("Gen12") != std::string::npos ||
+        dev_name.find("Xe") != std::string::npos)
+        return true;
+
+    if (get_device_type(device) == device_type::integrated_gpu) {
+        const std::vector<int> imad_ids = {
+            0x9A40, 0x9A49, 0x9A59, 0x9AD9,
+            0x9A60, 0x9A68, 0x9A70, 0x9A78,
+            0x9A7F, 0x9AF8, 0x9AC0, 0x9AC9
+        };
+        int dev_id = driver_dev_id(get_pci_bus_info(device));
+        if (dev_id == 0)
+            return false;
+
+        if (std::find(imad_ids.begin(), imad_ids.end(), dev_id) != imad_ids.end())
+            return true;
+    } else {
+        return true;
+    }
+
+    return false;
+}
+
+device_info init_device_info(const ::sycl::device& device, const ::sycl::context& context) {
+    device_info info = {};
+    info.vendor_id = device.get_info<::sycl::info::device::vendor_id>();
+    info.dev_name = device.get_info<::sycl::info::device::name>();
+    info.driver_version = device.get_info<::sycl::info::device::driver_version>();
+    info.dev_type = get_device_type(device);
+
+    info.cacheline_size = device.get_info<::sycl::info::device::global_mem_cache_line_size>();
+
+    info.execution_units_count = device.get_info<::sycl::info::device::max_compute_units>();
+
+    info.gpu_frequency = device.get_info<::sycl::info::device::max_clock_frequency>();
+
+    info.max_work_group_size = static_cast<uint64_t>(device.get_info<::sycl::info::device::max_work_group_size>());
+
+    info.max_local_mem_size = device.get_info<::sycl::info::device::local_mem_size>();
+    info.max_global_mem_size = device.get_info<::sycl::info::device::global_mem_size>();
+    info.max_alloc_mem_size = device.get_info<::sycl::info::device::max_mem_alloc_size>();
+    info.max_global_cache_size = device.get_info<::sycl::info::device::global_mem_cache_size>();
+
+    // Image is not yet supported in this SYCL runtime
+    info.supports_image = false;
+
+    info.supports_intel_planar_yuv = false; // no corresponding aspect in SYCL
+    info.supports_fp16 = device.has(::sycl::aspect::fp16);
+    info.supports_fp64 = device.has(::sycl::aspect::fp64);
+    if (info.supports_fp16) {
+        auto half_fp_config = device.get_info<::sycl::info::device::half_fp_config>();
+        info.supports_fp16_denorms = std::find(half_fp_config.begin(), half_fp_config.end(),
+                                               ::sycl::info::fp_config::denorm) != half_fp_config.end();
+    } else {
+        info.supports_fp16_denorms = false;
+    }
+
+    info.supports_khr_subgroups = true; // SYCL 2020 requires subgroups support
+    info.supports_intel_subgroups = false; // no corresponding aspect in SYCL
+    info.supports_intel_subgroups_short = false; // no corresponding aspect in SYCL
+    info.supports_intel_subgroups_char = false; // no corresponding aspect in SYCL
+    info.supports_intel_required_subgroup_size = true; // to use sub_group_sizes as SIMD sizes
+
+    info.supports_imad = get_imad_support(device);
+    info.supports_immad = false;
+
+    info.supports_usm = device.has(::sycl::aspect::usm_host_allocations) ||
+                        device.has(::sycl::aspect::usm_shared_allocations) ||
+                        device.has(::sycl::aspect::usm_device_allocations);
+
+    info.supports_queue_families = false; // no corresponding aspect in SYCL
+
+    if (info.supports_intel_required_subgroup_size) {
+        info.supported_simd_sizes = device.get_info<::sycl::info::device::sub_group_sizes>();
+    } else {
+        // Set these values as reasonable default for most of the supported platforms
+        info.supported_simd_sizes = {8, 16, 32};
+    }
+
+    bool device_uuid_supported = device.has(::sycl::aspect::ext_intel_device_info_uuid);
+    if (device_uuid_supported) {
+        auto uuid = device.get_info<::sycl::ext::intel::info::device::uuid>();
+        static_assert(uuid.size() == ov::device::UUID::MAX_UUID_SIZE, "");
+        info.uuid.uuid = uuid;
+    } else {
+        std::fill_n(std::begin(info.uuid.uuid), ov::device::UUID::MAX_UUID_SIZE, 0);
+    }
+
+    // sycl::aspect::ext_intel_device_info_luid is described in
+    // https://github.com/intel/llvm/blob/sycl/sycl/doc/extensions/supported/sycl_ext_intel_device_info.md
+    // DPC++ 6.2.0 and later will support this aspect.
+    // if (device.has(::sycl::aspect::ext_intel_device_info_luid)) {
+    //     auto luid = device.get_info<::sycl::ext::intel::info::device::luid>();
+    //     static_assert(luid.size() == ov::device::LUID::MAX_LUID_SIZE, "");
+    //     info.luid.luid = luid;
+    // } else {
+        std::fill_n(std::begin(info.luid.luid), ov::device::LUID::MAX_LUID_SIZE, 0);
+    // }
+
+    // Discrete GPUs always keep constants in device memory; integrated GPUs are
+    // enabled per vendor below (Intel: gfx_ver >= 12.70, same as the OCL runtime).
+    info.has_separate_cache = info.dev_type == device_type::discrete_gpu;
+    info.arch = gpu_arch::unknown;
+
+    if (info.vendor_id == INTEL_VENDOR_ID) {
+        info.ip_version = 0; // no corresponding info in SYCL
+        info.gfx_ver = {0, 0, 0}; // no corresponding info in SYCL
+        if (device.has(::sycl::aspect::ext_intel_device_id)) {
+            info.device_id = device.get_info<::sycl::ext::intel::info::device::device_id>();
+        }
+        if (device.has(::sycl::aspect::ext_intel_gpu_slices)) {
+            info.num_slices = device.get_info<::sycl::ext::intel::info::device::gpu_slices>();
+        }
+        if (device.has(::sycl::aspect::ext_intel_gpu_subslices_per_slice)) {
+            info.num_sub_slices_per_slice = device.get_info<::sycl::ext::intel::info::device::gpu_subslices_per_slice>();
+        }
+        if (device.has(::sycl::aspect::ext_intel_gpu_eu_count_per_subslice)) {
+            info.num_eus_per_sub_slice = device.get_info<::sycl::ext::intel::info::device::gpu_eu_count_per_subslice>();
+        }
+        if (device.has(::sycl::aspect::ext_intel_gpu_hw_threads_per_eu)) {
+            info.num_threads_per_eu = device.get_info<::sycl::ext::intel::info::device::gpu_hw_threads_per_eu>();
+        }
+
+#if SYCL_EXT_ONEAPI_MATRIX
+        auto matrix_combinations = device.get_info<::sycl::ext::oneapi::experimental::info::device::matrix_combinations>();
+        info.supports_immad = matrix_combinations.size() > 0;
+#endif // SYCL_EXT_ONEAPI_MATRIX
+
+#if defined(ENABLE_ONEDNN_FOR_GPU) && defined(OV_GPU_VENDOR_INTEL)
+        using namespace dnnl::impl::gpu::intel::jit;
+        ngen::Product product = generator_t<ngen::HW::Unknown>::detectHWInfo(context, device);
+        info.arch = convert_ngen_arch(ngen::getCore(product.family));
+        // We change the value of this flag to avoid OneDNN usage for the platforms unknown to OneDNN
+        // This is required to guarantee some level of forward compatibility for the new HW generations
+        // as OneDNN code generators are not generic and typically requires some updates for the new architectures
+        // Ideally, we shouldn't do that as OCL impls sometimes also check this flag, but in order to avoid that
+        // we need to ensure that graph transformations are not relying on this flag as indicator that onednn will be used
+        if (product.family == ngen::ProductFamily::Unknown) {
+            info.supports_immad = false;
+        }
+#endif
+
+        const uint32_t ip_version = query_device_ip_version(device);
+        if (ip_version != 0) {
+            // Same check as the OCL runtime (gfx_ver >= 12.70); discrete GPUs are already set above
+            info.has_separate_cache = info.has_separate_cache || parse_version(ip_version) >= gfx_version{12, 70, 0};
+        } else {
+            // Fallback when the architecture query is unavailable or returns 0:
+            // xe_hp/xe_hpc are discrete-only, so for iGPUs arch >= xe_hpg means MTL/ARL or newer
+            // (see ngen::npack::decodeHWIPVersion). iGPUs with unknown arch keep false.
+            info.has_separate_cache = info.has_separate_cache || info.arch >= gpu_arch::xe_hpg;
+        }
+    } else if (info.vendor_id == NVIDIA_VENDOR_ID) {
+        info.gfx_ver = {0, 0, 0}; // no corresponding info in SYCL
+    } else {
+        info.gfx_ver = {0, 0, 0};
+        info.device_id = driver_dev_id(get_pci_bus_info(device));
+        info.num_slices = 0;
+        info.num_sub_slices_per_slice = 0;
+        info.num_eus_per_sub_slice = 0;
+        info.num_threads_per_eu = 0;
+    }
+
+    info.num_ccs = 1;
+
+    info.supports_bf16 = info.supports_immad;
+
+    return info;
+}
+
+memory_capabilities init_memory_caps(const ::sycl::device& device, const device_info& info) {
+    std::vector<allocation_type> memory_caps;
+    memory_caps.push_back(allocation_type::sycl_buffer);
+    if (info.supports_usm) {
+        if (device.has(::sycl::aspect::usm_host_allocations)) {
+            memory_caps.push_back(allocation_type::usm_host);
+        }
+        if (device.has(::sycl::aspect::usm_shared_allocations)) {
+            memory_caps.push_back(allocation_type::usm_shared);
+        }
+        if (device.has(::sycl::aspect::usm_device_allocations)) {
+            memory_caps.push_back(allocation_type::usm_device);
+        }
+    }
+
+    return memory_capabilities(memory_caps);
+}
+
+}  // namespace
+
+
+sycl_device::sycl_device(const ::sycl::device dev, const ::sycl::context& ctx, const ::sycl::platform& platform)
+: _context(ctx)
+, _device(dev)
+, _platform(platform)
+, _info(init_device_info(dev, ctx))
+, _mem_caps(init_memory_caps(dev, _info))
+, _is_initialized(true){
+}
+
+bool sycl_device::is_same(const device::ptr other) {
+    auto casted = downcast<sycl_device>(other.get());
+    if (!casted)
+        return false;
+
+    return _device == casted->get_device() && _platform == casted->get_platform();
+}
+
+void sycl_device::set_mem_caps(const memory_capabilities& memory_capabilities) {
+    _mem_caps = memory_capabilities;
+}
+
+void sycl_device::initialize() {
+    if (_is_initialized)
+        return;
+}
+
+}  // namespace sycl
+}  // namespace cldnn

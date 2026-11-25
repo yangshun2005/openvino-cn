@@ -1,0 +1,197 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+
+#include <algorithm>
+
+#include "intel_gpu/primitives/primitive.hpp"
+#include "intel_gpu/runtime/utils.hpp"
+#ifdef ENABLE_ONEDNN_FOR_GPU
+#include "dnnl.hpp"
+#endif
+namespace cldnn {
+
+class NodeFuseParams {
+public:
+    explicit NodeFuseParams(primitive_type_id type) : _type(type) {}
+    virtual ~NodeFuseParams() = default;
+    virtual primitive_type_id type() const { return _type; }
+    virtual size_t ops_count() const { return 0; }
+
+private:
+    const primitive_type_id _type;
+};
+
+// Dependency(Input) type of fusing operation in fused node.
+// There are different ways to generate input var name and type by the dependency(input) type in MakeOpJitConstants in jitter
+// - ORIGINAL: The input of the operation is the fused node such as Conv
+// - EXTERNAL: The input of the operation is the external node outside the fused node
+// - INTERNAL: The input of the operation is the another fused operation in the fused node
+enum class FusedInputType {
+    UNDEFINED  = -1,
+    ORIGINAL   = 0,
+    EXTERNAL   = 1,
+    INTERNAL   = 2
+};
+
+struct fused_primitive_desc {
+    explicit fused_primitive_desc(const std::shared_ptr<const primitive>& prim) : desc(prim) {}
+
+    template <class PType>
+    bool is_type() const {
+        static_assert(meta::is_primitive<PType>::value,
+            "Type argument fused_primitive_desc::is_type should be a non-const, non-volatile type derived from primitive");
+        return desc->type == PType::type_id();
+    }
+
+    template <class PType>
+    std::shared_ptr<const PType> typed_desc() const { return std::static_pointer_cast<const PType>(desc); }
+
+    template<typename T>
+    std::shared_ptr<T> get_typed_fuse_params() const {
+        auto p = std::dynamic_pointer_cast<T>(f_param);
+        if (!p) {
+            throw std::runtime_error("Invalid dynamic cast of fused parameters!");
+        }
+        return p;
+    }
+
+    bool operator==(const fused_primitive_desc& rhs) const {
+        if (total_num_deps != rhs.total_num_deps) {
+            return false;
+        }
+        if (outer_dep_start_idx != rhs.outer_dep_start_idx) {
+            return false;
+        }
+
+        return *desc == *rhs.desc;
+    }
+
+    bool operator!=(const fused_primitive_desc& rhs) const { return !(*this == rhs); }
+
+    bool has_outer_dep() const { return outer_dep_start_idx >= 0; }
+
+    const layout& get_output_layout() const {
+        OPENVINO_ASSERT(output_layouts.size() == 1, "Design changed to allow multiple layouts, this path is not expected to be impacted.");
+        return output_layouts[0];
+    }
+
+    void set_output_layout(layout& new_layout, size_t idx = 0) {
+        OPENVINO_ASSERT(idx < output_layouts.size(),
+                        "Invalid index : index is ",
+                        std::to_string(idx),
+                        " but output_layouts length is ",
+	                    std::to_string(output_layouts.size()));
+        new_layout.data_padding = output_layouts[idx].data_padding;
+        output_layouts[idx] = new_layout;
+    }
+
+    std::shared_ptr<const primitive> desc;
+    std::shared_ptr<NodeFuseParams> f_param;
+
+    layout input_layout;
+    std::vector<layout> output_layouts;
+
+    struct InputDescriptor {
+        InputDescriptor(FusedInputType type, size_t idx, ov::element::Type_t element_type) : m_type(type), m_idx(idx), m_element_type(element_type) {};
+
+        FusedInputType m_type;
+        size_t m_idx;
+        ov::element::Type_t m_element_type;
+    };
+
+    std::vector<InputDescriptor> inputs;
+
+
+    std::vector<std::pair<primitive_id, size_t>> deps;
+    std::map<primitive_id, size_t> fused_deps;
+    // TODO: store the actual dependency indices with an alias flag, not only the start of the block.
+    // If the peer node and the fused node share a dependency, it is appended a second time instead of
+    // being marked as an alias. The second entry adds one to the shared node's user count. Passes that
+    // require a single user then skip the node.
+    // Do not just drop the duplicate because it is the only record of the sharing in the graph. Without an
+    // alias flag the node reports one user. One user is taken as permission to reuse its buffer in place,
+    // for example by get_add_fusing_type.
+    int32_t outer_dep_start_idx = -1; // if -1, no external dep after fusing
+    size_t total_num_deps = 0;
+};
+
+template<typename... SupportedTypes>
+bool fused_ops_are_one_of(const std::vector<fused_primitive_desc>& fused_ops) {
+    std::array supported_type_ids = {(SupportedTypes::type_id())...};
+    return std::all_of(fused_ops.begin(), fused_ops.end(), [&supported_type_ids](const auto& fd) {
+        return one_of(fd.desc->type, supported_type_ids);
+    });
+}
+
+#ifdef ENABLE_ONEDNN_FOR_GPU
+enum class onednn_post_op_type : uint32_t {
+    eltwise_act,
+    eltwise_clip,
+    eltwise_linear,
+    eltwise_round,
+    eltwise_hardsigmoid,
+    binary_mul,
+    binary_mul_inplace,
+    binary_add,
+    binary_sub,
+    binary_max,
+    binary_min,
+    binary_relu,
+    binary_div,
+    scale,
+    sum,
+    optimized,
+    optimized_eltwise_act,
+    optimized_eltwise_clip,
+    optimized_eltwise_linear,
+    optimized_eltwise_round,
+    optimized_sum
+};
+
+static inline std::ostream& operator<< (std::ostream& os, onednn_post_op_type& t) {
+    switch (t) {
+        case onednn_post_op_type::eltwise_act: os << "eltwise_act"; break;
+        case onednn_post_op_type::eltwise_clip: os << "eltwise_clip"; break;
+        case onednn_post_op_type::eltwise_linear: os << "eltwise_linear"; break;
+        case onednn_post_op_type::eltwise_round: os << "eltwise_round"; break;
+        case onednn_post_op_type::eltwise_hardsigmoid: os << "eltwise_hardsigmoid"; break;
+        case onednn_post_op_type::binary_mul: os << "binary_mul"; break;
+        case onednn_post_op_type::binary_mul_inplace: os << "binary_mul_inplace"; break;
+        case onednn_post_op_type::binary_add: os << "binary_add"; break;
+        case onednn_post_op_type::binary_sub: os << "binary_sub"; break;
+        case onednn_post_op_type::binary_max: os << "binary_max"; break;
+        case onednn_post_op_type::binary_min: os << "binary_min"; break;
+        case onednn_post_op_type::binary_relu: os << "binary_relu"; break;
+        case onednn_post_op_type::binary_div: os << "binary_div"; break;
+        case onednn_post_op_type::scale: os << "scale"; break;
+        case onednn_post_op_type::sum: os << "sum"; break;
+        case onednn_post_op_type::optimized: os << "optimized"; break;
+        case onednn_post_op_type::optimized_eltwise_act: os << "optimized_eltwise_act"; break;
+        case onednn_post_op_type::optimized_eltwise_clip: os << "optimized_eltwise_clip"; break;
+        case onednn_post_op_type::optimized_eltwise_linear: os << "optimized_eltwise_linear"; break;
+        case onednn_post_op_type::optimized_eltwise_round: os << "optimized_eltwise_round"; break;
+        case onednn_post_op_type::optimized_sum: os << "optimized_sum"; break;
+        default: os << "invalid";
+    }
+    return os;
+}
+
+struct fused_primitive_desc_onednn {
+    onednn_post_op_type op_type; // onednn post-operation type
+    size_t mem_offset;           // index of a memory buffer for current post-operation
+    size_t mem_dep;              // memory dependency for working with fused node
+    dnnl::memory::format_tag tag;
+    bool flatten;
+    dnnl::memory::dims dims;
+    dnnl::memory::data_type dt;
+};
+#endif // ENABLE_ONEDNN_FOR_GPU
+} // namespace cldnn
+
+
+namespace ov::intel_gpu {
+    using FusedPrimitiveDesc = cldnn::fused_primitive_desc;
+}  // namespace ov::intel_gpu

@@ -1,0 +1,370 @@
+// Copyright (C) 2018-2026 Intel Corporation
+// SPDX-License-Identifier: Apache-2.0
+//
+
+#pragma once
+
+#include "intel_gpu/op/fc_weights_layout.hpp"
+#include "primitive.hpp"
+#include <optional>
+#include <vector>
+
+namespace cldnn {
+
+/// @brief Performs forward fully connected layer (inner product).
+/// Also supports built-in Relu @CLDNN_PRIMITIVE_DESC{activation} available by setting it in arguments.
+/// @notes
+/// - Equation: Input[F x Y x F] x Output(X) == Weights(B x F x X x F) has to be fulfilled
+/// - Bias has to be linear data [1,1,1,X], where X is equal to number of outputs.
+
+/// <table>
+/// <caption id = "multi_row">Format support</caption>
+///        <tr><th>Data type               <th>activation format       <th>weights format
+///        <tr><td rowspan="7">F32         <td rowspan="4">bfyx        <td>yxfb
+///        <tr>                                                        <td>fyxb
+///        <tr>                                                        <td>bs_fs_fsv8_bsv8
+///        <tr>                                                        <td>bs_f_bsv16
+///        <tr>                            <td rowspan="3">yxfb        <td>bfyx
+///        <tr>                                                        <td>yxfb
+///        <tr>                                                        <td>bs_fs_fsv8_bsv8
+///        <tr><td rowspan="4">F16         <td rowspan="3">bfyx        <td>yxfb
+///        <tr>                                                        <td>fyxb
+///        <tr>                                                        <td>bs_f_bsv16
+///        <tr>                            <td >yxfb                   <td>bfyx
+/// </table>
+
+struct fully_connected : public primitive_base<fully_connected> {
+    CLDNN_DECLARE_PRIMITIVE(fully_connected)
+
+    fully_connected() : primitive_base("", {}) {}
+
+    /// @brief Constructs fully connected layer.
+    /// @param id This primitive id.
+    /// @param input Input primitive id.
+    /// @param weights Primitive id containing weights data.
+    /// @param bias Primitive id containing bias data. Provide empty string if using Relu without bias.
+    fully_connected(const primitive_id& id,
+                    const input_info& input,
+                    const primitive_id& weights,
+                    const primitive_id& bias = "",
+                    const size_t input_size = 2,
+                    const size_t weights_rank = 2,
+                    const bool weights_transposed = true,
+                    const std::optional<ov::intel_gpu::op::FcWeightsLayout>& weights_layout = std::nullopt)
+        : primitive_base(id, {input}),
+          weights(weights),
+          bias(bias),
+          input_size(input_size),
+          weights_rank(weights_rank),
+          weights_transposed(weights_transposed),
+          weights_layout(resolve_weights_layout(weights_layout, weights_transposed))
+    {}
+
+    /// @brief Constructs fully connected layer.
+    /// @param id This primitive id.
+    /// @param input Input primitive id.
+    /// @param weights Primitive id containing weights data.
+    /// @param bias Primitive id containing bias data. Provide empty string if using Relu without bias.
+    fully_connected(const primitive_id& id,
+                    const input_info& input,
+                    const primitive_id& weights,
+                    const primitive_id& bias,
+                    const data_types data_type,
+                    const size_t input_size = 2,
+                    const size_t weights_rank = 2,
+                    const bool weights_transposed = true,
+                    const std::optional<ov::intel_gpu::op::FcWeightsLayout>& weights_layout = std::nullopt)
+        : primitive_base(id, { input }, 1, {optional_data_type{data_type}}),
+          weights(weights),
+          bias(bias),
+          input_size(input_size),
+          weights_rank(weights_rank),
+          weights_transposed(weights_transposed),
+          weights_layout(resolve_weights_layout(weights_layout, weights_transposed))
+    {}
+
+    /// @brief Constructs fully connected compressed layer.
+    /// @param id This primitive id.
+    /// @param input Input primitive id.
+    /// @param weights Primitive id containing weights data.
+    /// @param bias Primitive id containing bias data.
+    /// @param compression_scale Primitive id containing scale factors for weights decompression.
+    /// @param compression_zero_point Primitive id containing zero points for weights decompression.
+    fully_connected(const primitive_id& id,
+                    const input_info& input,
+                    const primitive_id& weights,
+                    const primitive_id& bias,
+                    const primitive_id& decompression_scale,
+                    const primitive_id& decompression_zero_point,
+                    const data_types data_type,
+                    const size_t input_size = 2,
+                    const size_t weights_rank = 2,
+                    const bool weights_transposed = true,
+                    const bool transpose_b_scale = true,
+                    const bool transpose_b_zp = true,
+                    const std::optional<ov::intel_gpu::op::FcWeightsLayout>& weights_layout = std::nullopt)
+        : primitive_base(id, { input }, 1, {optional_data_type{data_type}}),
+          weights(weights),
+          bias(bias),
+          compressed_weights(true),
+          decompression_scale(decompression_scale),
+          decompression_zero_point(decompression_zero_point),
+          dynamic_quantized_activation(false),
+          dynamic_quantized_activation_zp(false),
+          input_size(input_size),
+          weights_rank(weights_rank),
+          weights_transposed(weights_transposed),
+          transpose_b_scale(transpose_b_scale),
+          transpose_b_zp(transpose_b_zp),
+          weights_layout(resolve_weights_layout(weights_layout, weights_transposed)) {
+        OPENVINO_ASSERT(!decompression_scale.empty(), "[GPU] Compressed fully connected requires at least decompression scale input");
+    }
+
+    /// @brief Constructs fully connected compressed layer.
+    /// @param id This primitive id.
+    /// @param input Input primitive id.
+    /// @param weights Primitive id containing weights data.
+    /// @param bias Primitive id containing bias data.
+    /// @param compression_scale Primitive id containing scale factors for weights decompression.
+    /// @param compression_zero_point Primitive id containing zero points for weights decompression.
+    /// @param activation_scale Primitive id containing scale factor for activation.
+    /// @param activation_zero_point Primitive id containing zero point for activation.
+    /// @param activation_precomputed_reduction Primitive id containing precomputed reduction for activation.
+    fully_connected(const primitive_id& id,
+                    const input_info& input,
+                    const primitive_id& weights,
+                    const primitive_id& bias,
+                    const primitive_id& decompression_scale,
+                    const primitive_id& decompression_zero_point,
+                    const input_info& activation_scale,
+                    const input_info& activation_zero_point,
+                    const input_info& activation_precomputed_reduction,
+                    const data_types data_type,
+                    const size_t input_size = 2,
+                    const size_t weights_rank = 2,
+                    const bool weights_transposed = true,
+                    const bool transpose_b_scale = true,
+                    const bool transpose_b_zp = true,
+                    const std::optional<ov::intel_gpu::op::FcWeightsLayout>& weights_layout = std::nullopt)
+        : primitive_base(id, { input }, 1, {optional_data_type{data_type}}),
+          weights(weights),
+          bias(bias),
+          compressed_weights(true),
+          decompression_scale(decompression_scale),
+          decompression_zero_point(decompression_zero_point),
+          dynamic_quantized_activation(false),
+          dynamic_quantized_activation_zp(false),
+          activation_scale(activation_scale),
+          activation_zero_point(activation_zero_point),
+          activation_precomputed_reduction(activation_precomputed_reduction),
+          input_size(input_size),
+          weights_rank(weights_rank),
+          weights_transposed(weights_transposed),
+          transpose_b_scale(transpose_b_scale),
+          transpose_b_zp(transpose_b_zp),
+          weights_layout(resolve_weights_layout(weights_layout, weights_transposed)) {
+        if (activation_scale.is_valid()) {
+            dynamic_quantized_activation = true;
+        }
+        if (activation_zero_point.is_valid()) {
+            dynamic_quantized_activation_zp = true;
+        }
+        if (activation_precomputed_reduction.is_valid()) {
+            dynamic_quantized_precomputed_reduction = true;
+        }
+
+        OPENVINO_ASSERT(!decompression_scale.empty(), "[GPU] Compressed fully connected requires at least decompression scale input");
+    }
+
+    /// @brief Primitive id containing weights data.
+    input_info weights;
+    /// @brief Primitive id containing bias data.
+    input_info bias;
+
+    bool compressed_weights = false;
+    input_info decompression_scale;
+    input_info decompression_zero_point;
+    bool dynamic_quantized_activation = false;
+    bool dynamic_quantized_activation_zp = false;
+    bool dynamic_quantized_precomputed_reduction = false;
+    input_info activation_scale = {"", 0};
+    input_info activation_zero_point = {"", 0};
+    input_info activation_precomputed_reduction = {"", 0};
+    std::optional<float> decompression_zero_point_scalar;
+
+    /// @brief Input pre-transform: blockwise normalised Walsh-Hadamard of size
+    /// hadamard_block along K, after an optional per-element sign flip. Set by
+    /// FuseHadamardIntoFC; only the TernOCL int2 implementation honours it.
+    size_t hadamard_block = 0;
+    std::vector<int8_t> hadamard_signs;
+
+    /// @brief Primitive dimension size.
+    size_t input_size = 2;
+    /// @brief Primitive weights rank.
+    size_t weights_rank = 2;
+    /// @brief Weights transposed.
+    bool weights_transposed = true;
+    /// @brief true: scale/zp layout is [N, groups]; false: [groups, N].
+    bool transpose_b_scale = true;
+    bool transpose_b_zp = true;
+    /// @brief Physical weights layout (NK / KN follow weights_transposed; GNK is [K / gs, N, gs]).
+    ov::intel_gpu::op::FcWeightsLayout weights_layout = ov::intel_gpu::op::FcWeightsLayout::NK;
+
+
+    size_t hash() const override {
+        size_t seed = primitive::hash();
+        seed = hash_combine(seed, input_size);
+        seed = hash_combine(seed, weights_rank);
+        seed = hash_combine(seed, weights_transposed);
+        seed = hash_combine(seed, transpose_b_scale);
+        seed = hash_combine(seed, transpose_b_zp);
+        seed = hash_combine(seed, static_cast<uint8_t>(weights_layout));
+        seed = hash_combine(seed, bias.is_valid());
+        seed = hash_combine(seed, compressed_weights);
+        seed = hash_combine(seed, !decompression_scale.is_valid());
+        seed = hash_combine(seed, !decompression_zero_point.is_valid());
+        seed = hash_combine(seed, activation_scale.is_valid());
+        seed = hash_combine(seed, activation_zero_point.is_valid());
+        seed = hash_combine(seed, activation_precomputed_reduction.is_valid());
+        seed = hash_combine(seed, decompression_zero_point_scalar.has_value());
+        seed = hash_combine(seed, decompression_zero_point_scalar.value_or(0.0F));
+        seed = hash_combine(seed, hadamard_block);
+        seed = hash_combine(seed, hadamard_signs.size());
+        return seed;
+    }
+
+    bool operator==(const primitive& rhs) const override {
+        if (!compare_common_params(rhs)) {
+            return false;
+        }
+
+        auto rhs_casted = downcast<const fully_connected>(rhs);
+
+        return input_size == rhs_casted.input_size &&
+               weights_rank == rhs_casted.weights_rank &&
+               weights_transposed == rhs_casted.weights_transposed &&
+               transpose_b_scale == rhs_casted.transpose_b_scale &&
+               transpose_b_zp == rhs_casted.transpose_b_zp &&
+               weights_layout == rhs_casted.weights_layout &&
+               bias.is_valid() == rhs_casted.bias.is_valid() &&
+               compressed_weights == rhs_casted.compressed_weights &&
+               decompression_scale.is_valid() == rhs_casted.decompression_scale.is_valid() &&
+               decompression_zero_point.is_valid() == rhs_casted.decompression_zero_point.is_valid() &&
+               activation_scale.is_valid() == rhs_casted.activation_scale.is_valid() &&
+               activation_zero_point.is_valid() == rhs_casted.activation_zero_point.is_valid() &&
+               activation_precomputed_reduction.is_valid() == rhs_casted.activation_precomputed_reduction.is_valid() &&
+               decompression_zero_point_scalar.value_or(0.0F) == rhs_casted.decompression_zero_point_scalar.value_or(0.0F) &&
+               hadamard_block == rhs_casted.hadamard_block && hadamard_signs == rhs_casted.hadamard_signs;
+    }
+
+    void save(BinaryOutputBuffer& ob) const override {
+        primitive_base<fully_connected>::save(ob);
+        ob << weights;
+        ob << bias;
+        ob << compressed_weights;
+        ob << decompression_scale;
+        ob << decompression_zero_point;
+        ob << activation_scale;
+        ob << activation_zero_point;
+        ob << activation_precomputed_reduction;
+        ob << input_size;
+        ob << weights_rank;
+        ob << weights_transposed;
+        ob << transpose_b_scale;
+        ob << transpose_b_zp;
+        ob << dynamic_quantized_activation;
+        ob << dynamic_quantized_activation_zp;
+        ob << dynamic_quantized_precomputed_reduction;
+
+        if (decompression_zero_point_scalar.has_value()) {
+            ob << true;
+            float decompression_zero_point_value = decompression_zero_point_scalar.value();
+            ob << decompression_zero_point_value;
+        } else {
+            ob << false;
+        }
+        ob << make_data(&weights_layout, sizeof(weights_layout));
+        ob << hadamard_block;
+        ob << hadamard_signs;
+    }
+
+    void load(BinaryInputBuffer& ib) override {
+        primitive_base<fully_connected>::load(ib);
+        ib >> weights;
+        ib >> bias;
+        ib >> compressed_weights;
+        ib >> decompression_scale;
+        ib >> decompression_zero_point;
+        ib >> activation_scale;
+        ib >> activation_zero_point;
+        ib >> activation_precomputed_reduction;
+        ib >> input_size;
+        ib >> weights_rank;
+        ib >> weights_transposed;
+        ib >> transpose_b_scale;
+        ib >> transpose_b_zp;
+        ib >> dynamic_quantized_activation;
+        ib >> dynamic_quantized_activation_zp;
+        ib >> dynamic_quantized_precomputed_reduction;
+
+        bool has_value;
+        ib >> has_value;
+        if (has_value) {
+            float decompression_zero_point_value = 0.F;
+            ib >> decompression_zero_point_value;
+            decompression_zero_point_scalar = decompression_zero_point_value;
+        } else {
+            decompression_zero_point_scalar = std::optional<float>();
+        }
+        ib >> make_data(&weights_layout, sizeof(weights_layout));
+        ib >> hadamard_block;
+        ib >> hadamard_signs;
+        OPENVINO_ASSERT(ov::intel_gpu::op::fc_weights_layout_is_consistent(weights_layout, weights_transposed),
+                        "[GPU] Loaded FullyConnected has inconsistent weights_layout");
+    }
+
+protected:
+    static ov::intel_gpu::op::FcWeightsLayout resolve_weights_layout(const std::optional<ov::intel_gpu::op::FcWeightsLayout>& layout,
+                                                                    bool weights_transposed) {
+        const auto resolved = layout.value_or(ov::intel_gpu::op::fc_default_weights_layout(weights_transposed));
+        OPENVINO_ASSERT(ov::intel_gpu::op::fc_weights_layout_is_consistent(resolved, weights_transposed),
+                        "[GPU] FullyConnected weights_layout ", ov::intel_gpu::op::to_string(resolved),
+                        " is inconsistent with weights_transposed = ", weights_transposed);
+        return resolved;
+    }
+
+    std::map<size_t, const input_info*> get_dependencies_map() const override {
+        auto ret = std::map<size_t, const input_info*>{};
+        auto idx = input.size();
+
+        OPENVINO_ASSERT(weights.is_valid());
+        ret[idx++] = &weights;
+
+        if (bias.is_valid()) {
+            ret[idx++] = &bias;
+        }
+
+        if (decompression_scale.is_valid()) {
+            ret[idx++] = &decompression_scale;
+        }
+
+        if (decompression_zero_point.is_valid()) {
+            ret[idx++] = &decompression_zero_point;
+        }
+
+        if (activation_scale.is_valid()) {
+            ret[idx++] = &activation_scale;
+        }
+
+        if (activation_zero_point.is_valid()) {
+            ret[idx++] = &activation_zero_point;
+        }
+
+        if (activation_precomputed_reduction.is_valid()) {
+            ret[idx++] = &activation_precomputed_reduction;
+        }
+
+        return ret;
+    }
+};
+}  // namespace cldnn
